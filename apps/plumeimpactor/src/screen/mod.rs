@@ -1,7 +1,8 @@
 pub(crate) mod general;
 pub(crate) mod package;
-mod progress;
+pub(crate) mod progress;
 pub(crate) mod settings;
+mod tvos_pairing;
 mod utilties;
 mod windows;
 
@@ -79,6 +80,7 @@ pub enum Message {
     SettingsScreen(settings::Message),
     InstallerScreen(package::Message),
     ProgressScreen(progress::Message),
+    TvOsPairingScreen(tvos_pairing::Message),
     CertificateResetRequested(crate::certificate_reset::ConfirmationRequest),
     ConfirmCertificateReset,
     CancelCertificateReset,
@@ -103,12 +105,14 @@ pub struct Impactor {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum ImpactorScreenType {
     Main,
     Utilities,
     Settings,
     Installer,
     Progress,
+    TvOsPairing,
 }
 
 enum ImpactorScreen {
@@ -117,6 +121,7 @@ enum ImpactorScreen {
     Settings(settings::SettingsScreen),
     Installer(package::PackageScreen),
     Progress(progress::ProgressScreen),
+    TvOsPairing(tvos_pairing::TvOsPairingScreen),
 }
 
 impl Impactor {
@@ -199,7 +204,25 @@ impl Impactor {
                 Task::none()
             }
             Message::DeviceConnected(device) => {
-                if !self.devices.iter().any(|d| d.device_id == device.device_id) {
+                let existing_index = self.devices.iter().position(|existing| {
+                    existing.device_id == device.device_id
+                        || (plume_utils::is_valid_device_udid(&existing.udid)
+                            && plume_utils::is_valid_device_udid(&device.udid)
+                            && existing.udid.eq_ignore_ascii_case(&device.udid))
+                });
+                if let Some(existing_index) = existing_index {
+                    let existing_id = self.devices[existing_index].device_id;
+                    let selected_existing = self.selected_device.as_ref().map(|d| d.device_id)
+                        == Some(existing_id);
+                    self.devices[existing_index] = device.clone();
+
+                    if selected_existing
+                        || self.selected_device.as_ref().map(|d| d.device_id)
+                            == Some(device.device_id)
+                    {
+                        self.selected_device = Some(device.clone());
+                    }
+                } else {
                     self.devices.push(device.clone());
 
                     if self.selected_device.is_none()
@@ -210,9 +233,11 @@ impl Impactor {
                     }
                 }
 
-                if let Some(daemon_devices) = REFRESH_DAEMON_DEVICES.get() {
-                    if let Ok(mut devices) = daemon_devices.lock() {
-                        devices.insert(device.udid.clone(), device.clone());
+                if !device.udid.is_empty() {
+                    if let Some(daemon_devices) = REFRESH_DAEMON_DEVICES.get() {
+                        if let Ok(mut devices) = daemon_devices.lock() {
+                            devices.insert(device.udid.clone(), device.clone());
+                        }
                     }
                 }
 
@@ -300,6 +325,7 @@ impl Impactor {
                     ImpactorScreen::Installer(_) => ImpactorScreenType::Progress,
                     ImpactorScreen::Settings(_) => return Task::none(),
                     ImpactorScreen::Progress(_) => return Task::none(),
+                    ImpactorScreen::TvOsPairing(_) => return Task::none(),
                 };
 
                 self.navigate_to_screen(next_screen);
@@ -321,6 +347,10 @@ impl Impactor {
                     } else {
                         self.navigate_to_screen(ImpactorScreenType::Main);
                     }
+                    Task::none()
+                }
+                ImpactorScreen::TvOsPairing(_) => {
+                    self.navigate_to_screen(ImpactorScreenType::Main);
                     Task::none()
                 }
                 ImpactorScreen::Settings(_) => {
@@ -501,6 +531,10 @@ impl Impactor {
                         return Task::done(Message::UtilitiesScreen(
                             utilties::Message::RefreshApps(rppairing_enabled),
                         ));
+                    } else if let general::Message::NavigateTvOsPairing = msg {
+                        self.current_screen =
+                            ImpactorScreen::TvOsPairing(tvos_pairing::TvOsPairingScreen::new());
+                        return Task::none();
                     }
 
                     task
@@ -777,6 +811,25 @@ impl Impactor {
                     Task::none()
                 }
             }
+            Message::TvOsPairingScreen(msg) => {
+                if let ImpactorScreen::TvOsPairing(ref mut screen) = self.current_screen {
+                    let paired_device = match &msg {
+                        tvos_pairing::Message::PairComplete(Ok(device))
+                        | tvos_pairing::Message::ReconnectComplete(Ok(device)) => {
+                            Some(device.clone())
+                        }
+                        _ => None,
+                    };
+                    let update = screen.update(msg).map(Message::TvOsPairingScreen);
+                    if let Some(device) = paired_device {
+                        Task::batch([update, Task::done(Message::DeviceConnected(device))])
+                    } else {
+                        update
+                    }
+                } else {
+                    Task::none()
+                }
+            }
             Message::RefreshAppNow { udid, app_path } => {
                 if let Some(daemon_devices) = REFRESH_DAEMON_DEVICES.get() {
                     let daemon_devices = daemon_devices.clone();
@@ -913,6 +966,7 @@ impl Impactor {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let device_subscription = subscriptions::device_listener();
+        let network_device_subscription = subscriptions::network_device_listener();
 
         let tray_subscription = subscriptions::tray_subscription();
 
@@ -922,19 +976,15 @@ impl Impactor {
             _ => Subscription::none(),
         };
 
-        let progress_subscription =
-            if let ImpactorScreen::Progress(ref progress) = self.current_screen {
-                subscriptions::installation_progress_listener(progress.progress_rx.clone()).map(
-                    |(status, progress_val)| {
-                        Message::ProgressScreen(progress::Message::InstallationProgress(
-                            status,
-                            progress_val,
-                        ))
-                    },
-                )
-            } else {
-                Subscription::none()
-            };
+        let progress_subscription = if let ImpactorScreen::Progress(ref progress) =
+            self.current_screen
+        {
+            subscriptions::installation_progress_listener(progress.progress_rx.clone()).map(
+                |update| Message::ProgressScreen(progress::Message::InstallationProgress(update)),
+            )
+        } else {
+            Subscription::none()
+        };
 
         let tray_menu_refresh_subscription = subscriptions::tray_menu_refresh_subscription();
         let certificate_reset_subscription = subscriptions::certificate_reset_subscription();
@@ -973,6 +1023,7 @@ impl Impactor {
 
         Subscription::batch(vec![
             device_subscription,
+            network_device_subscription,
             tray_subscription,
             hover_subscription,
             progress_subscription,
@@ -1017,6 +1068,9 @@ impl Impactor {
                 screen.view(has_device).map(Message::InstallerScreen)
             }
             ImpactorScreen::Progress(screen) => screen.view().map(Message::ProgressScreen),
+            ImpactorScreen::TvOsPairing(screen) => {
+                screen.view().map(Message::TvOsPairingScreen)
+            }
         }
     }
 
@@ -1035,11 +1089,12 @@ impl Impactor {
             .clone()
             .unwrap_or_else(|| t!("no_device").to_string());
 
-        let right_button = if matches!(self.current_screen, ImpactorScreen::Settings(_)) {
-            button(appearance::icon(appearance::CHEVRON_BACK))
-                .on_press(Message::PreviousScreen)
-                .style(appearance::s_button)
-        } else if matches!(self.current_screen, ImpactorScreen::Utilities(_)) {
+        let right_button = if matches!(
+            self.current_screen,
+            ImpactorScreen::Settings(_)
+                | ImpactorScreen::Utilities(_)
+                | ImpactorScreen::TvOsPairing(_)
+        ) {
             button(appearance::icon(appearance::CHEVRON_BACK))
                 .on_press(Message::PreviousScreen)
                 .style(appearance::s_button)
@@ -1135,7 +1190,12 @@ impl Impactor {
             ImpactorScreenType::Progress => {
                 self.current_screen = ImpactorScreen::Progress(progress::ProgressScreen::new());
             }
-            _ => {}
+            ImpactorScreenType::TvOsPairing => {
+                self.current_screen =
+                    ImpactorScreen::TvOsPairing(tvos_pairing::TvOsPairingScreen::new());
+            }
+            ImpactorScreenType::Installer => {
+            }
         }
     }
 
@@ -1194,10 +1254,16 @@ impl Impactor {
 
                     match result {
                         Ok(_) => {
-                            let _ = tx.send((t!("progress_finished").to_string(), 100));
+                            let _ = tx.send(progress::ProgressUpdate::new(
+                                t!("progress_finished").to_string(),
+                                100,
+                            ));
                         }
                         Err(e) => {
-                            let _ = tx_error.send((format!("{}: {}", t!("progress_error"), e), -1));
+                            let _ = tx_error.send(progress::ProgressUpdate::new(
+                                format!("{}: {}", t!("progress_error"), e),
+                                -1,
+                            ));
                         }
                     }
 
