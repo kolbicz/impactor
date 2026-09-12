@@ -196,7 +196,11 @@ pub(crate) fn build_device(
         name,
         hostname: short_hostname(hostname).to_string(),
         udid,
-        ip_address: addresses.first().map(|a| a.to_string()),
+        ip_address: addresses
+            .iter()
+            .find(|address| address.is_ipv4())
+            .or_else(|| addresses.first())
+            .map(|address| address.to_string()),
         port,
         device_type,
         connection_type: ConnectionType::WiFi,
@@ -546,6 +550,23 @@ mod tests {
         assert_eq!(d.connection_type, ConnectionType::WiFi);
         assert!(!d.is_paired);
         assert_eq!(d.service_type, REMOTEPAIRING_SERVICE);
+    }
+
+    #[test]
+    fn mapping_prefers_ipv4_over_unscoped_link_local_ipv6() {
+        let d = build_device(
+            "TV",
+            "TV.local.",
+            REMOTEPAIRING_MANUAL_PAIRING_SERVICE,
+            Some(63295),
+            &[
+                "fe80::1020:429f:1e8:d85d".parse::<IpAddr>().unwrap(),
+                "192.168.2.150".parse::<IpAddr>().unwrap(),
+            ],
+            &props(&[("model", "AppleTV14,1")]),
+        );
+
+        assert_eq!(d.ip_address.as_deref(), Some("192.168.2.150"));
     }
 
     #[test]
