@@ -15,6 +15,30 @@ pub struct MdnsDiscovery {
     service_types: Vec<String>,
 }
 
+#[derive(Default)]
+pub(crate) struct MdnsAccumulator {
+    devices: HashMap<(String, String), DiscoveredDevice>,
+}
+
+impl MdnsAccumulator {
+    pub(crate) fn insert(
+        &mut self,
+        instance_name: &str,
+        hostname: &str,
+        service_type: &str,
+        device: DiscoveredDevice,
+    ) {
+        self.devices.insert(
+            dedup_key(hostname, instance_name, service_type),
+            device,
+        );
+    }
+
+    pub(crate) fn into_devices(self) -> Vec<DiscoveredDevice> {
+        self.devices.into_values().collect()
+    }
+}
+
 impl MdnsDiscovery {
     pub fn new() -> Self {
         Self {
@@ -49,8 +73,7 @@ impl DeviceDiscovery for MdnsDiscovery {
 
         let service_types = self.service_types.clone();
         let discovered = tokio::task::spawn_blocking(move || {
-            let mut discovered_devices: HashMap<(String, String), DiscoveredDevice> =
-                HashMap::new();
+            let mut discovered_devices = MdnsAccumulator::default();
             let deadline = std::time::Instant::now() + timeout;
 
             while std::time::Instant::now() < deadline {
@@ -92,9 +115,12 @@ impl DeviceDiscovery for MdnsDiscovery {
                                 port
                             );
 
-                            let key = dedup_key(hostname, &instance_name, service_type);
-
-                            discovered_devices.insert(key, device);
+                            discovered_devices.insert(
+                                &instance_name,
+                                hostname,
+                                service_type,
+                                device,
+                            );
                         }
                         Ok(_) => {
                             got_event = true;
@@ -113,19 +139,21 @@ impl DeviceDiscovery for MdnsDiscovery {
             }
             let _ = mdns.shutdown();
 
-            discovered_devices
+            discovered_devices.into_devices()
         })
         .await
         .map_err(|e| crate::Error::Other(format!("mDNS scan task failed: {e}")))?;
 
-        Ok(enrich_and_filter(discovered.into_values().collect()))
+        Ok(enrich_and_filter(discovered))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::DeviceType;
+    use crate::discovery::{DeviceType, REMOTEPAIRING_SERVICE, build_device};
+    use std::net::IpAddr;
+    use std::collections::HashMap;
 
     #[test]
     fn test_device_type_from_class() {
@@ -146,6 +174,35 @@ mod tests {
             DeviceType::from_product_type("iPhone15,2"),
             DeviceType::IPhone
         );
+    }
+
+    #[test]
+    fn accumulator_replaces_duplicate_resolved_advertisements() {
+        let mut accumulator = MdnsAccumulator::default();
+        let first = build_device(
+            "Living Room",
+            "Living-Room.local.",
+            REMOTEPAIRING_SERVICE,
+            Some(49152),
+            &["192.0.2.10".parse::<IpAddr>().unwrap()],
+            &HashMap::from([(String::from("model"), String::from("AppleTV14,1"))]),
+        );
+        let second = build_device(
+            "Living Room",
+            "Living-Room.local.",
+            REMOTEPAIRING_SERVICE,
+            Some(49153),
+            &["192.0.2.10".parse::<IpAddr>().unwrap()],
+            &HashMap::from([(String::from("model"), String::from("AppleTV14,1"))]),
+        );
+
+        accumulator.insert("Living Room", "Living-Room.local.", REMOTEPAIRING_SERVICE, first);
+        accumulator.insert("Living Room", "Living-Room.local.", REMOTEPAIRING_SERVICE, second);
+
+        let devices = accumulator.into_devices();
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].port, Some(49153));
     }
 
     #[tokio::test]

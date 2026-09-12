@@ -310,7 +310,12 @@ impl Signer {
 
                 if let Some(e) = macho.entitlements().as_ref() {
                     session
-                        .v1_request_capabilities_for_entitlements(&team_id, &id, e)
+                        .v1_request_capabilities_for_entitlements_on_platform(
+                            &team_id,
+                            &id,
+                            e,
+                            platform,
+                        )
                         .await?;
                 }
 
@@ -472,12 +477,17 @@ impl Signer {
                 .ok_or_else(|| Error::Other("Signed bundle has no bundle identifier".to_string()))?;
             let profile_path = signed_bundle.bundle_dir().join("embedded.mobileprovision");
             let profile = MobileProvision::load_with_path(profile_path)?;
-            profile.validate_for(
+            let final_entitlements = macho.entitlements().clone().ok_or_else(|| {
+                Error::Core(plume_core::Error::ProvisioningProfileInvalid(
+                    "signed executable has no entitlements".to_string(),
+                ))
+            })?;
+            profile.validate_final_entitlements(
                 platform,
                 &bundle_id,
                 device_udid,
                 certificate_der,
-                macho.entitlements().as_ref(),
+                &final_entitlements,
             )?;
         }
 
@@ -541,10 +551,11 @@ impl Signer {
             let executable_name = signed_bundle
                 .get_executable()
                 .ok_or_else(|| Error::Other("Signable bundle has no executable".into()))?;
-            let macho = plume_core::MachO::new(&signed_bundle.bundle_dir().join(executable_name))?;
+            let binary_path = signed_bundle.bundle_dir().join(executable_name);
+            let macho = plume_core::MachO::new(&binary_path)?;
             let mut last_error = None;
 
-            let valid = self.provisioning_files.iter().any(|profile| {
+            let matching_profile = self.provisioning_files.iter().find(|profile| {
                 match profile.validate_for(
                     platform,
                     &bundle_id,
@@ -560,14 +571,39 @@ impl Signer {
                 }
             });
 
-            if !valid {
+            let Some(matching_profile) = matching_profile else {
                 let error = last_error.unwrap_or_else(|| {
                     plume_core::Error::ProvisioningProfileInvalid(format!(
                         "no profile grants {bundle_id}"
                     ))
                 });
                 return Err(Error::Core(error));
-            }
+            };
+
+            let mut effective_profile = matching_profile.clone();
+            effective_profile.merge_entitlements(binary_path.clone(), &bundle_id)?;
+            let final_entitlements = if self.options.embedding.single_profile {
+                self.options
+                    .custom_entitlements
+                    .as_ref()
+                    .map(|path| {
+                        let value = Value::from_file(path)?;
+                        value.as_dictionary().cloned().ok_or_else(|| {
+                            Error::Other("Custom entitlements file is not a dictionary".to_string())
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| effective_profile.entitlements().clone())
+            } else {
+                effective_profile.entitlements().clone()
+            };
+            effective_profile.validate_final_entitlements(
+                platform,
+                &bundle_id,
+                device_udid,
+                certificate_der,
+                &final_entitlements,
+            )?;
             log::info!("ProfileValidated: true for {bundle_id} on {platform}");
         }
 

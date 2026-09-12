@@ -104,6 +104,25 @@ pub struct Impactor {
     last_installer: Option<package::PackageScreen>,
 }
 
+fn same_device_identity(first: &Device, second: &Device) -> bool {
+    if first.device_id != 0 && second.device_id != 0 && first.device_id == second.device_id {
+        return true;
+    }
+
+    if plume_utils::is_valid_device_udid(&first.udid)
+        && plume_utils::is_valid_device_udid(&second.udid)
+        && first.udid.eq_ignore_ascii_case(&second.udid)
+    {
+        return true;
+    }
+
+    first
+        .pairing_identity
+        .as_ref()
+        .zip(second.pairing_identity.as_ref())
+        .is_some_and(|(first, second)| first.eq_ignore_ascii_case(second))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum ImpactorScreenType {
@@ -204,33 +223,26 @@ impl Impactor {
                 Task::none()
             }
             Message::DeviceConnected(device) => {
-                let existing_index = self.devices.iter().position(|existing| {
-                    existing.device_id == device.device_id
-                        || (plume_utils::is_valid_device_udid(&existing.udid)
-                            && plume_utils::is_valid_device_udid(&device.udid)
-                            && existing.udid.eq_ignore_ascii_case(&device.udid))
-                });
-                if let Some(existing_index) = existing_index {
-                    let existing_id = self.devices[existing_index].device_id;
-                    let selected_existing = self.selected_device.as_ref().map(|d| d.device_id)
-                        == Some(existing_id);
-                    self.devices[existing_index] = device.clone();
+                let selected_before = self.selected_device.clone();
+                let mut devices = std::mem::take(&mut self.devices);
+                devices.push(device.clone());
+                self.devices = plume_utils::deduplicate_devices(devices);
 
-                    if selected_existing
-                        || self.selected_device.as_ref().map(|d| d.device_id)
-                            == Some(device.device_id)
-                    {
-                        self.selected_device = Some(device.clone());
-                    }
-                } else {
-                    self.devices.push(device.clone());
-
-                    if self.selected_device.is_none()
-                        && device.device_id != u32::MAX
-                        && self.device_is_enabled(&device)
-                    {
-                        self.selected_device = Some(device.clone());
-                    }
+                if let Some(selected_before) = selected_before {
+                    self.selected_device = self
+                        .devices
+                        .iter()
+                        .find(|candidate| {
+                            same_device_identity(candidate, &selected_before)
+                                && self.device_is_enabled(candidate)
+                        })
+                        .cloned();
+                } else if device.device_id != u32::MAX && self.device_is_enabled(&device) {
+                    self.selected_device = self
+                        .devices
+                        .iter()
+                        .find(|candidate| same_device_identity(candidate, &device))
+                        .cloned();
                 }
 
                 if !device.udid.is_empty() {

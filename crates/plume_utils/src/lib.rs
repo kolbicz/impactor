@@ -8,11 +8,10 @@ pub mod pairing;
 mod signer;
 mod tweak;
 
-use std::collections::HashMap;
 use std::path::Path;
 pub use bundle::{Bundle, BundleType};
 pub use device::{
-    Device, DeviceTransport, TvosDeviceInfo, get_device_for_id, install_app_mac,
+    CoreDeviceTransport, Device, DeviceTransport, TvosDeviceInfo, get_device_for_id, install_app_mac,
     synthetic_device_id,
 };
 pub use options::{
@@ -106,20 +105,24 @@ pub async fn copy_dir_recursively(src: &Path, dst: &Path) -> Result<()> {
 
 pub use plume_core::is_valid_device_udid;
 
-fn dedup_key_for_device(device: &Device) -> Option<String> {
+fn dedup_keys_for_device(device: &Device) -> Vec<String> {
+    let mut keys = Vec::new();
     if is_valid_device_udid(&device.udid) {
-        return Some(format!("udid:{}", device.udid.to_ascii_lowercase()));
+        keys.push(format!("udid:{}", device.udid.to_ascii_lowercase()));
     }
 
-    if device.is_network() {
-        return device
-            .pairing_identity
-            .as_deref()
-            .filter(|identity| !identity.is_empty())
-            .map(|identity| format!("pairing:{}", identity.to_ascii_lowercase()));
+    if let Some(identity) = device
+        .pairing_identity
+        .as_deref()
+        .filter(|identity| !identity.is_empty())
+    {
+        keys.push(format!("pairing:{}", identity.to_ascii_lowercase()));
+    }
+    if let Some(usbmuxd) = &device.usbmuxd_device {
+        keys.push(format!("mux:{}", usbmuxd.device_id));
     }
 
-    None
+    keys
 }
 
 fn device_quality(device: &Device) -> usize {
@@ -127,11 +130,14 @@ fn device_quality(device: &Device) -> usize {
     if is_valid_device_udid(&device.udid) {
         score += 100;
     }
-    if device.is_network() && device.pairing_identity.is_some() {
+    if device.pairing_identity.is_some() {
         score += 40;
     }
     if device.usbmuxd_device.is_some() {
         score += 20;
+    }
+    if device.core_device_authenticated {
+        score += 25;
     }
     score += device.product_type.is_some() as usize * 10;
     score += device.device_class.is_some() as usize * 8;
@@ -143,26 +149,78 @@ fn device_quality(device: &Device) -> usize {
 }
 
 pub fn deduplicate_devices(devices: impl IntoIterator<Item = Device>) -> Vec<Device> {
-    let mut result = Vec::new();
-    let mut indexes = HashMap::new();
+    let mut groups: Vec<(Vec<String>, Device)> = Vec::new();
 
     for device in devices {
-        let Some(key) = dedup_key_for_device(&device) else {
-            result.push(device);
+        let keys = dedup_keys_for_device(&device);
+        let matching_indexes = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, (group_keys, _))| keys.iter().any(|key| group_keys.contains(key)))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+
+        let Some(first_index) = matching_indexes.first().copied() else {
+            groups.push((keys, device));
             continue;
         };
 
-        if let Some(index) = indexes.get(&key).copied() {
-            if device_quality(&device) > device_quality(&result[index]) {
-                result[index] = device;
-            }
-        } else {
-            indexes.insert(key, result.len());
-            result.push(device);
+        merge_devices(&mut groups[first_index].1, device);
+        groups[first_index].0 = dedup_keys_for_device(&groups[first_index].1);
+
+        for index in matching_indexes.into_iter().skip(1).rev() {
+            let (_, other) = groups.remove(index);
+            merge_devices(&mut groups[first_index].1, other);
+            groups[first_index].0 = dedup_keys_for_device(&groups[first_index].1);
         }
     }
 
-    result
+    groups.into_iter().map(|(_, device)| device).collect()
+}
+
+fn merge_devices(existing: &mut Device, mut incoming: Device) {
+    if device_quality(&incoming) > device_quality(existing) {
+        std::mem::swap(existing, &mut incoming);
+    }
+
+    if existing.name.is_empty() {
+        existing.name = incoming.name;
+    }
+    if !is_valid_device_udid(&existing.udid) && is_valid_device_udid(&incoming.udid) {
+        existing.udid = incoming.udid;
+    }
+    if existing.product_type.is_none() {
+        existing.product_type = incoming.product_type;
+    }
+    if existing.device_class.is_none() {
+        existing.device_class = incoming.device_class;
+    }
+    if existing.os_version.is_none() {
+        existing.os_version = incoming.os_version;
+    }
+    if existing.serial_number.is_none() {
+        existing.serial_number = incoming.serial_number;
+    }
+    if existing.usbmuxd_device.is_none() {
+        existing.usbmuxd_device = incoming.usbmuxd_device;
+    }
+    if existing.pairing_address.is_none() {
+        existing.pairing_address = incoming.pairing_address;
+    }
+    if existing.reconnect_address.is_none() {
+        existing.reconnect_address = incoming.reconnect_address;
+    }
+    if existing.pairing_identity.is_none() {
+        existing.pairing_identity = incoming.pairing_identity;
+    }
+    if existing.pairing_cache_dir.is_none() {
+        existing.pairing_cache_dir = incoming.pairing_cache_dir;
+    }
+    if existing.device_id == 0 {
+        existing.device_id = incoming.device_id;
+    }
+    existing.is_mac |= incoming.is_mac;
+    existing.core_device_authenticated |= incoming.core_device_authenticated;
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -233,6 +291,31 @@ mod tests {
             authenticated.reconnect_address
         );
         assert_eq!(devices[0].os_version, authenticated.os_version);
+    }
+
+    #[test]
+    fn bridges_legacy_pairing_identity_to_authenticated_udid() {
+        let cache_dir = std::env::temp_dir();
+        let legacy = Device::new_tvos(
+            "Living Room".to_string(),
+            "Living-Room".to_string(),
+            "192.0.2.10".parse().unwrap(),
+            None,
+            Some(49152),
+            cache_dir.clone(),
+        );
+        let mut authenticated = legacy.clone();
+        authenticated.udid = "00008110-000C25540CD1801E".to_string();
+        authenticated.core_device_authenticated = true;
+
+        let devices = deduplicate_devices([legacy, authenticated]);
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(
+            devices[0].udid,
+            "00008110-000C25540CD1801E".to_string()
+        );
+        assert!(devices[0].core_device_authenticated);
     }
 
     #[test]

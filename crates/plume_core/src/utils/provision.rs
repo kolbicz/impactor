@@ -193,6 +193,104 @@ impl MobileProvision {
         Ok(())
     }
 
+    pub fn validate_final_entitlements(
+        &self,
+        platform: DeveloperPlatform,
+        bundle_id: &str,
+        device_udid: Option<&str>,
+        certificate_der: Option<&[u8]>,
+        entitlements: &Dictionary,
+    ) -> Result<(), Error> {
+        self.validate_for(
+            platform,
+            bundle_id,
+            device_udid,
+            certificate_der,
+            None,
+        )?;
+
+        let profile_application_identifier = self
+            .entitlements
+            .get("application-identifier")
+            .and_then(Value::as_string)
+            .ok_or_else(|| {
+                Error::ProvisioningProfileInvalid(
+                    "profile has no application identifier".to_string(),
+                )
+            })?;
+        let application_identifier = entitlements
+            .get("application-identifier")
+            .and_then(Value::as_string)
+            .ok_or_else(|| {
+                Error::ProvisioningProfileInvalid(
+                    "signed executable has no application identifier".to_string(),
+                )
+            })?;
+        let final_bundle_id = application_identifier_bundle_id(application_identifier)
+            .ok_or_else(|| {
+                Error::ProvisioningProfileInvalid(
+                    "signed executable has an invalid application identifier".to_string(),
+                )
+            })?;
+        if final_bundle_id != bundle_id
+            || !application_identifier_grants(profile_application_identifier, final_bundle_id)
+        {
+            return Err(Error::ProvisioningProfileInvalid(format!(
+                "signed executable application identifier {application_identifier:?} does not match {bundle_id:?}"
+            )));
+        }
+
+        let profile_team_identifier = self
+            .entitlements
+            .get("com.apple.developer.team-identifier")
+            .and_then(Value::as_string)
+            .or_else(|| application_identifier_team(profile_application_identifier))
+            .ok_or_else(|| {
+                Error::ProvisioningProfileInvalid(
+                    "profile has no team identifier".to_string(),
+                )
+            })?;
+        let final_team_identifier = entitlements
+            .get("com.apple.developer.team-identifier")
+            .and_then(Value::as_string)
+            .or_else(|| application_identifier_team(application_identifier))
+            .ok_or_else(|| {
+                Error::ProvisioningProfileInvalid(
+                    "signed executable has no team identifier".to_string(),
+                )
+            })?;
+        if final_team_identifier != profile_team_identifier
+            || application_identifier_team(profile_application_identifier)
+                .is_some_and(|team| team != profile_team_identifier)
+            || application_identifier_team(application_identifier)
+                .is_some_and(|team| team != profile_team_identifier)
+        {
+            return Err(Error::ProvisioningProfileInvalid(
+                "signed executable team identifier does not match the provisioning profile"
+                    .to_string(),
+            ));
+        }
+
+        for (key, requested) in entitlements {
+            if key == "application-identifier" || key == "com.apple.developer.team-identifier" {
+                continue;
+            }
+
+            let Some(granted) = self.entitlements.get(key) else {
+                return Err(Error::ProvisioningProfileInvalid(format!(
+                    "profile does not grant entitlement {key:?}"
+                )));
+            };
+            if !value_grants(granted, requested) {
+                return Err(Error::ProvisioningProfileInvalid(format!(
+                    "profile does not grant entitlement {key:?}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     fn extract_profile_data(
         data: &[u8],
     ) -> Result<(Dictionary, Date, Vec<String>, Vec<String>, Vec<Vec<u8>>), Error> {
@@ -256,16 +354,7 @@ fn string_values(value: Option<&Value>) -> Vec<String> {
 }
 
 fn application_identifier_grants(granted: &str, requested: &str) -> bool {
-    let granted_bundle_id = match (granted.get(..10), granted.as_bytes().get(10), granted.get(11..)) {
-        (Some(team), Some(b'.'), Some(bundle_id))
-            if team
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()) =>
-        {
-            bundle_id
-        }
-        _ => granted,
-    };
+    let granted_bundle_id = application_identifier_bundle_id(granted).unwrap_or(granted);
 
     if granted_bundle_id == requested {
         return true;
@@ -278,6 +367,33 @@ fn application_identifier_grants(granted: &str, requested: &str) -> bool {
     granted_bundle_id
         .strip_suffix(".*")
         .is_some_and(|prefix| requested.starts_with(prefix) && requested.len() > prefix.len())
+}
+
+fn application_identifier_bundle_id(value: &str) -> Option<&str> {
+    let (team, bundle_id) = value.split_once('.')?;
+    if team.len() == 10
+        && team
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        && !bundle_id.is_empty()
+    {
+        Some(bundle_id)
+    } else {
+        None
+    }
+}
+
+fn application_identifier_team(value: &str) -> Option<&str> {
+    let (team, _) = value.split_once('.')?;
+    if team.len() == 10
+        && team
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        Some(team)
+    } else {
+        None
+    }
 }
 
 fn value_grants(granted: &Value, requested: &Value) -> bool {
@@ -572,6 +688,83 @@ mod tests {
                 Some("00008110-000C25540CD1801E"),
                 Some(certificate_der()),
                 Some(&requested),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("entitlement"));
+    }
+
+    #[test]
+    fn accepts_profile_entitlements_as_final_entitlements() {
+        let profile = valid_profile();
+        profile
+            .validate_final_entitlements(
+                DeveloperPlatform::Tvos,
+                "com.example.tv",
+                Some("00008110-000C25540CD1801E"),
+                Some(certificate_der()),
+                profile.entitlements(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_final_application_identifier_mismatch() {
+        let profile = valid_profile();
+        let mut entitlements = profile.entitlements().clone();
+        entitlements.insert(
+            "application-identifier".to_string(),
+            Value::String("L988J7YMK5.com.example.other".to_string()),
+        );
+
+        let error = profile
+            .validate_final_entitlements(
+                DeveloperPlatform::Tvos,
+                "com.example.tv",
+                Some("00008110-000C25540CD1801E"),
+                Some(certificate_der()),
+                &entitlements,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("application identifier"));
+    }
+
+    #[test]
+    fn rejects_final_team_identifier_mismatch() {
+        let profile = valid_profile();
+        let mut entitlements = profile.entitlements().clone();
+        entitlements.insert(
+            "com.apple.developer.team-identifier".to_string(),
+            Value::String("OTHERTEAM1".to_string()),
+        );
+
+        let error = profile
+            .validate_final_entitlements(
+                DeveloperPlatform::Tvos,
+                "com.example.tv",
+                Some("00008110-000C25540CD1801E"),
+                Some(certificate_der()),
+                &entitlements,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("team identifier"));
+    }
+
+    #[test]
+    fn rejects_final_entitlement_not_granted_by_profile() {
+        let profile = valid_profile();
+        let mut entitlements = profile.entitlements().clone();
+        entitlements.insert(
+            "com.apple.developer.networking.wifi-info".to_string(),
+            Value::Boolean(true),
+        );
+
+        let error = profile
+            .validate_final_entitlements(
+                DeveloperPlatform::Tvos,
+                "com.example.tv",
+                Some("00008110-000C25540CD1801E"),
+                Some(certificate_der()),
+                &entitlements,
             )
             .unwrap_err();
         assert!(error.to_string().contains("entitlement"));

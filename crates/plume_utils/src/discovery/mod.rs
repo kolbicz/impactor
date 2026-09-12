@@ -318,10 +318,6 @@ pub fn group_network_devices(discovered: &[DiscoveredDevice], cache_dir: &Path) 
         let Some(ip) = group.ip else {
             continue;
         };
-        if group.pairing_port.is_none() && group.reconnect_port.is_none() {
-            continue;
-        }
-
         let pairing_identity = if group.hostname.is_empty() {
             group.name.replace(' ', "-")
         } else {
@@ -925,6 +921,23 @@ mod tests {
     }
 
     #[test]
+    fn group_network_devices_retains_legacy_core_device_until_authenticated_data_arrives() {
+        let discovered = [network_apple_tv(
+            "Living Room",
+            APPLE_MOBDEV2_SERVICE,
+            62078,
+            "10.0.0.5",
+        )];
+
+        let devices = group_network_devices(&discovered, Path::new("/cache"));
+
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].pairing_address.is_none());
+        assert!(devices[0].reconnect_address.is_none());
+        assert!(devices[0].udid.is_empty());
+    }
+
+    #[test]
     fn group_network_devices_keeps_same_named_hosts_separate() {
         let mut first = network_apple_tv("Living Room", REMOTEPAIRING_SERVICE, 49152, "10.0.0.5");
         let mut second = network_apple_tv("Living Room", REMOTEPAIRING_SERVICE, 49152, "10.0.0.6");
@@ -973,7 +986,7 @@ mod tests {
 
     #[test]
     fn group_network_devices_excludes_unsupported_service() {
-        let d = network_apple_tv("Living Room", APPLE_MOBDEV2_SERVICE, 62078, "10.0.0.5");
+        let d = network_apple_tv("Living Room", APPLE_PAIRABLE_SERVICE, 62078, "10.0.0.5");
 
         let devices = group_network_devices(&[d], Path::new("/cache"));
 

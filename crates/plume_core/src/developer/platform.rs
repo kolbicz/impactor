@@ -30,6 +30,13 @@ impl DeveloperPlatform {
         }
     }
 
+    pub fn capabilities_filter(self) -> &'static str {
+        match self {
+            DeveloperPlatform::Ios => "IOS",
+            DeveloperPlatform::Tvos => "TVOS",
+        }
+    }
+
     pub fn apply_to(self, body: &mut Dictionary) {
         let fields = self.request_fields();
         if fields.is_empty() {
@@ -83,6 +90,12 @@ mod tests {
             DeveloperPlatform::Tvos.request_fields(),
             &[("DTDK_Platform", "tvos"), ("subPlatform", "tvOS")]
         );
+    }
+
+    #[test]
+    fn capabilities_filter_matches_platform() {
+        assert_eq!(DeveloperPlatform::Ios.capabilities_filter(), "IOS");
+        assert_eq!(DeveloperPlatform::Tvos.capabilities_filter(), "TVOS");
     }
 
     #[test]

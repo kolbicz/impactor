@@ -135,6 +135,55 @@ impl TvosDeviceInfo {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CoreDeviceTransport {
+    pairing_address: Option<(std::net::IpAddr, u16)>,
+    reconnect_address: Option<(std::net::IpAddr, u16)>,
+    pairing_identity: Option<String>,
+    udid: String,
+    cache_dir: PathBuf,
+    authenticated: bool,
+}
+
+impl CoreDeviceTransport {
+    fn new(device: &Device, cache_dir: PathBuf) -> Result<Self, Error> {
+        if device.usbmuxd_device.is_some() {
+            return Err(Error::Other(
+                "CoreDevice transport cannot wrap a usbmuxd device".to_string(),
+            ));
+        }
+        Ok(Self {
+            pairing_address: device.pairing_address,
+            reconnect_address: device.reconnect_address,
+            pairing_identity: device.pairing_identity.clone(),
+            udid: device.udid.clone(),
+            cache_dir,
+            authenticated: device.core_device_authenticated,
+        })
+    }
+
+    pub fn kind(&self) -> DeviceTransport {
+        if self.authenticated {
+            DeviceTransport::CoreDevice
+        } else if self.pairing_address.is_some() || self.reconnect_address.is_some() {
+            DeviceTransport::RemotePairing
+        } else {
+            DeviceTransport::Unavailable
+        }
+    }
+
+    pub async fn connect(&self) -> Result<(AdapterHandle, RsdHandshake), Error> {
+        establish_core_device_tunnel(
+            self.pairing_address,
+            self.reconnect_address,
+            self.pairing_identity.as_deref(),
+            &self.udid,
+            &self.cache_dir,
+        )
+        .await
+    }
+}
+
 pub fn synthetic_device_id(pairing_identity: &str) -> u32 {
     const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
     const FNV_PRIME: u32 = 0x0100_0193;
@@ -240,26 +289,7 @@ impl Device {
     }
 
     pub(crate) fn pairing_cache_path(&self, cache_dir: &Path) -> Result<PathBuf, Error> {
-        let key = self.pairing_identity.as_deref().unwrap_or(&self.udid);
-
-        if key.is_empty() {
-            return Err(Error::Other(
-                "Device has neither a pairing identity nor a UDID; cannot locate its pairing \
-                 file cache"
-                    .to_string(),
-            ));
-        }
-        if key.contains('/')
-            || key.contains('\\')
-            || key.contains(':')
-            || key.chars().all(|c| c == '.')
-        {
-            return Err(Error::Other(format!(
-                "Pairing identity {key:?} is not a valid cache key"
-            )));
-        }
-
-        Ok(cache_dir.join(format!("plume_{key}.plist")))
+        pairing_cache_path_for(self.pairing_identity.as_deref(), &self.udid, cache_dir)
     }
 
     pub fn is_tvos(&self) -> bool {
@@ -295,6 +325,13 @@ impl Device {
         }
     }
 
+    pub fn core_device_transport(
+        &self,
+        cache_dir: PathBuf,
+    ) -> Result<CoreDeviceTransport, Error> {
+        CoreDeviceTransport::new(self, cache_dir)
+    }
+
     pub async fn installed_apps(&self) -> Result<Vec<SignerAppReal>, Error> {
         let apps = if let Some(device) = &self.usbmuxd_device {
             let provider = device.to_provider(
@@ -307,7 +344,8 @@ impl Device {
             let cache_dir = self.pairing_cache_dir.clone().ok_or_else(|| {
                 Error::Other("Network Apple TV has no pairing cache directory".to_string())
             })?;
-            let (mut adapter, mut handshake) = self.establish_tvos_tunnel(cache_dir).await?;
+            let transport = self.core_device_transport(cache_dir)?;
+            let (mut adapter, mut handshake) = transport.connect().await?;
             let mut ic = InstallationProxyClient::connect_rsd(&mut adapter, &mut handshake).await?;
             ic.get_apps(Some("User"), None).await?
         } else {
@@ -347,7 +385,8 @@ impl Device {
             let cache_dir = self.pairing_cache_dir.clone().ok_or_else(|| {
                 Error::Other("Network Apple TV has no pairing cache directory".to_string())
             })?;
-            let (mut adapter, mut handshake) = self.establish_tvos_tunnel(cache_dir).await?;
+            let transport = self.core_device_transport(cache_dir)?;
+            let (mut adapter, mut handshake) = transport.connect().await?;
             let mut ic = InstallationProxyClient::connect_rsd(&mut adapter, &mut handshake).await?;
             ic.get_apps(Some("User"), None).await?
         } else {
@@ -369,7 +408,8 @@ impl Device {
             let cache_dir = self.pairing_cache_dir.clone().ok_or_else(|| {
                 Error::Other("Network Apple TV has no pairing cache directory".to_string())
             })?;
-            let (mut adapter, mut handshake) = self.establish_tvos_tunnel(cache_dir).await?;
+            let transport = self.core_device_transport(cache_dir)?;
+            let (mut adapter, mut handshake) = transport.connect().await?;
             let mut mc = MisagentClient::connect_rsd(&mut adapter, &mut handshake).await?;
             mc.install(profile.data.clone()).await?;
         } else {
@@ -569,43 +609,12 @@ impl Device {
         cache_dir: &Path,
         cache_path: &Path,
     ) -> Result<Option<RpPairingFile>, Error> {
-        let Some((ip, port)) = self.reconnect_address.or(self.pairing_address) else {
-            return Ok(None);
-        };
-        let address = std::net::SocketAddr::new(ip, port);
-
-        for (source, mut pairing_file) in external_pairing_candidates() {
-            let stream = match tokio::net::TcpStream::connect(address).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    log::debug!(
-                        "Could not connect to Apple TV while trying external pairing record {}: {error}",
-                        source
-                    );
-                    continue;
-                }
-            };
-            let sending_host = pairing_file.identifier.clone();
-            let mut client = RemotePairingClient::new(
-                RpPairingSocket::new(stream),
-                &sending_host,
-                &mut pairing_file,
-            );
-            let valid = client.attempt_pair_verify().await.is_ok()
-                && client.validate_pairing().await.is_ok();
-            drop(client);
-
-            if valid {
-                write_pairing_file(&pairing_file, cache_dir, cache_path).await?;
-                log::info!(
-                    "Imported an existing Apple TV pairing record from {}",
-                    source
-                );
-                return Ok(Some(pairing_file));
-            }
-        }
-
-        Ok(None)
+        try_import_external_pairing_at(
+            self.reconnect_address.or(self.pairing_address),
+            cache_dir,
+            cache_path,
+        )
+        .await
     }
 
     pub async fn pair_tvos<F, Fut>(
@@ -687,6 +696,12 @@ impl Device {
                 );
                 let _ = tokio::fs::remove_file(&cache_path).await;
             }
+            if let Some(pairing_file) =
+                self.try_import_external_pairing(&cache_dir, &cache_path).await?
+            {
+                log::info!("tvOS pairing: recovered an existing native pairing record");
+                return Ok(pairing_file);
+            }
         }
 
         let (ip, port) = self.pairing_address.ok_or_else(|| {
@@ -747,103 +762,7 @@ impl Device {
         &self,
         cache_dir: PathBuf,
     ) -> Result<(AdapterHandle, RsdHandshake), Error> {
-        let (ip, port) = self
-            .reconnect_address
-            .or(self.pairing_address)
-            .ok_or_else(|| Error::Other("Device has no network address".to_string()))?;
-
-        let connect_addr = std::net::SocketAddr::new(ip, port);
-
-        let cache_path = self.pairing_cache_path(&cache_dir)?;
-        let mut pairing_file = if cache_path.exists() {
-            RpPairingFile::read_from_file(&cache_path).await?
-        } else {
-            self.try_import_external_pairing(&cache_dir, &cache_path)
-                .await?
-                .ok_or_else(|| {
-                    Error::Other(
-                        "No pairing record is cached for this Apple TV; pair before reconnecting"
-                            .to_string(),
-                    )
-                })?
-        };
-
-        let stream = tokio::net::TcpStream::connect(connect_addr)
-            .await
-            .map_err(|e| {
-                Error::Other(format!(
-                    "Could not connect to Apple TV at {connect_addr}: {e}"
-                ))
-            })?;
-        let conn = RpPairingSocket::new(stream);
-
-        let hostname = pairing_file.identifier.clone();
-        let tunnel = {
-            let mut rpc = RemotePairingClient::new(conn, &hostname, &mut pairing_file);
-
-            rpc.attempt_pair_verify()
-                .await
-                .map_err(|e| Error::Other(format!("Pair-verify failed: {e}")))?;
-
-            if let Err(e) = rpc.validate_pairing().await {
-                if cache_path.exists() {
-                    log::warn!(
-                        "tvOS tunnel: cached pairing file at {} no longer verifies ({e}); \
-                         removing it",
-                        cache_path.display()
-                    );
-                    let _ = tokio::fs::remove_file(&cache_path).await;
-                }
-                return Err(Error::Other(format!(
-                    "This Apple TV no longer recognizes this pairing (it may have been reset, \
-                     forgotten, or lost pairing after a system update); pair with it again: {e}"
-                )));
-            }
-
-            let tunnel_port = rpc
-                .create_tcp_listener()
-                .await
-                .map_err(|e| Error::Other(format!("Failed to create tunnel listener: {e}")))?;
-
-            let tunnel_addr = std::net::SocketAddr::new(connect_addr.ip(), tunnel_port);
-            let tunnel_stream = tokio::net::TcpStream::connect(tunnel_addr)
-                .await
-                .map_err(|e| Error::Other(format!("TLS tunnel connect failed: {e}")))?;
-
-            connect_tls_psk_tunnel_native(Box::new(tunnel_stream), rpc.encryption_key())
-                .await
-                .map_err(|e| Error::Other(format!("TLS-PSK tunnel handshake failed: {e}")))?
-        };
-
-        let client_ip: std::net::IpAddr = tunnel
-            .info
-            .client_address
-            .parse()
-            .map_err(|e| Error::Other(format!("Invalid tunnel client address: {e}")))?;
-        let server_ip: std::net::IpAddr = tunnel
-            .info
-            .server_address
-            .parse()
-            .map_err(|e| Error::Other(format!("Invalid tunnel server address: {e}")))?;
-        let rsd_port = tunnel.info.server_rsd_port;
-        let mtu = tunnel.info.mtu as usize;
-        let mss = mtu.saturating_sub(60);
-        log::info!("tvOS tunnel: negotiated MTU {mtu}, using MSS {mss}");
-
-        let raw = tunnel.into_inner();
-        let mut adapter = Adapter::new(Box::new(raw), client_ip, server_ip);
-        adapter.set_mss(mss);
-        let mut adapter_handle = adapter.to_async_handle();
-
-        let rsd_stream = adapter_handle
-            .connect(rsd_port)
-            .await
-            .map_err(|e| Error::Other(format!("RSD connection failed: {e}")))?;
-        let handshake = RsdHandshake::new(rsd_stream)
-            .await
-            .map_err(|e| Error::Other(format!("RSD handshake failed: {e}")))?;
-
-        Ok((adapter_handle, handshake))
+        self.core_device_transport(cache_dir)?.connect().await
     }
 
     pub fn has_cached_pairing_file(&self, cache_dir: &Path) -> bool {
@@ -936,7 +855,8 @@ impl Device {
                 )
             })?;
 
-            let (mut adapter, mut handshake) = self.establish_tvos_tunnel(cache_dir).await?;
+            let transport = self.core_device_transport(cache_dir)?;
+            let (mut adapter, mut handshake) = transport.connect().await?;
 
             installation::install_package_with_callback_rsd(
                 &mut adapter,
@@ -955,6 +875,217 @@ impl Device {
 
         Ok(())
     }
+}
+
+fn pairing_cache_path_for(
+    pairing_identity: Option<&str>,
+    udid: &str,
+    cache_dir: &Path,
+) -> Result<PathBuf, Error> {
+    let key = pairing_identity.unwrap_or(udid);
+
+    if key.is_empty() {
+        return Err(Error::Other(
+            "Device has neither a pairing identity nor a UDID; cannot locate its pairing \
+             file cache"
+                .to_string(),
+        ));
+    }
+    if key.contains('/')
+        || key.contains('\\')
+        || key.contains(':')
+        || key.chars().all(|c| c == '.')
+    {
+        return Err(Error::Other(format!(
+            "Pairing identity {key:?} is not a valid cache key"
+        )));
+    }
+
+    Ok(cache_dir.join(format!("plume_{key}.plist")))
+}
+
+async fn try_import_external_pairing_at(
+    address: Option<(std::net::IpAddr, u16)>,
+    cache_dir: &Path,
+    cache_path: &Path,
+) -> Result<Option<RpPairingFile>, Error> {
+    let Some((ip, port)) = address else {
+        return Ok(None);
+    };
+    let address = std::net::SocketAddr::new(ip, port);
+
+    for (source, mut pairing_file) in external_pairing_candidates() {
+        let stream = match tokio::net::TcpStream::connect(address).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                log::debug!(
+                    "Could not connect to Apple TV while trying external pairing record {}: {error}",
+                    source
+                );
+                continue;
+            }
+        };
+        let sending_host = pairing_file.identifier.clone();
+        let mut client = RemotePairingClient::new(
+            RpPairingSocket::new(stream),
+            &sending_host,
+            &mut pairing_file,
+        );
+        let valid = client.attempt_pair_verify().await.is_ok()
+            && client.validate_pairing().await.is_ok();
+        drop(client);
+
+        if valid {
+            write_pairing_file(&pairing_file, cache_dir, cache_path).await?;
+            log::info!(
+                "Imported an existing Apple TV pairing record from {}",
+                source
+            );
+            return Ok(Some(pairing_file));
+        }
+    }
+
+    Ok(None)
+}
+
+enum CoreDeviceTunnelAttemptError {
+    Pairing(Error),
+    Tunnel(Error),
+}
+
+async fn establish_core_device_tunnel(
+    pairing_address: Option<(std::net::IpAddr, u16)>,
+    reconnect_address: Option<(std::net::IpAddr, u16)>,
+    pairing_identity: Option<&str>,
+    udid: &str,
+    cache_dir: &Path,
+) -> Result<(AdapterHandle, RsdHandshake), Error> {
+    let (ip, port) = reconnect_address
+        .or(pairing_address)
+        .ok_or_else(|| Error::Other("Device has no network address".to_string()))?;
+
+    let connect_addr = std::net::SocketAddr::new(ip, port);
+    let cache_path = pairing_cache_path_for(pairing_identity, udid, cache_dir)?;
+    let (mut pairing_file, mut can_try_external) = if cache_path.exists() {
+        (RpPairingFile::read_from_file(&cache_path).await?, true)
+    } else {
+        (
+            try_import_external_pairing_at(Some((ip, port)), cache_dir, &cache_path)
+                .await?
+                .ok_or_else(|| {
+                    Error::Other(
+                        "No pairing record is cached for this Apple TV; pair before reconnecting"
+                            .to_string(),
+                    )
+                })?,
+            false,
+        )
+    };
+
+    let tunnel = loop {
+        let stream = tokio::net::TcpStream::connect(connect_addr).await.map_err(|e| {
+            Error::Other(format!("Could not connect to Apple TV at {connect_addr}: {e}"))
+        })?;
+        let conn = RpPairingSocket::new(stream);
+        let hostname = pairing_file.identifier.clone();
+
+        let attempt: Result<_, CoreDeviceTunnelAttemptError> = async {
+            let mut rpc = RemotePairingClient::new(conn, &hostname, &mut pairing_file);
+
+            if let Err(e) = rpc.attempt_pair_verify().await {
+                return Err(CoreDeviceTunnelAttemptError::Pairing(Error::Other(
+                    format!("Pair-verify failed: {e}"),
+                )));
+            }
+
+            if let Err(e) = rpc.validate_pairing().await {
+                return Err(CoreDeviceTunnelAttemptError::Pairing(Error::Other(
+                    format!(
+                        "This Apple TV no longer recognizes this pairing (it may have been reset, \
+                         forgotten, or lost pairing after a system update); pair with it again: {e}"
+                    ),
+                )));
+            }
+
+            let tunnel_port = rpc.create_tcp_listener().await.map_err(|e| {
+                CoreDeviceTunnelAttemptError::Tunnel(Error::Other(format!(
+                    "Failed to create tunnel listener: {e}"
+                )))
+            })?;
+
+            let tunnel_addr = std::net::SocketAddr::new(connect_addr.ip(), tunnel_port);
+            let tunnel_stream = tokio::net::TcpStream::connect(tunnel_addr)
+                .await
+                .map_err(|e| {
+                    CoreDeviceTunnelAttemptError::Tunnel(Error::Other(format!(
+                        "TLS tunnel connect failed: {e}"
+                    )))
+                })?;
+
+            connect_tls_psk_tunnel_native(Box::new(tunnel_stream), rpc.encryption_key())
+                .await
+                .map_err(|e| {
+                    CoreDeviceTunnelAttemptError::Tunnel(Error::Other(format!(
+                        "TLS-PSK tunnel handshake failed: {e}"
+                    )))
+                })
+        }
+        .await;
+
+        match attempt {
+            Ok(tunnel) => break tunnel,
+            Err(CoreDeviceTunnelAttemptError::Pairing(error)) if can_try_external => {
+                can_try_external = false;
+                log::warn!(
+                    "tvOS tunnel: cached pairing file at {} is stale ({error}); removing it",
+                    cache_path.display()
+                );
+                let _ = tokio::fs::remove_file(&cache_path).await;
+
+                if let Some(imported) =
+                    try_import_external_pairing_at(Some((ip, port)), cache_dir, &cache_path)
+                        .await?
+                {
+                    pairing_file = imported;
+                    continue;
+                }
+
+                return Err(error);
+            }
+            Err(CoreDeviceTunnelAttemptError::Pairing(error))
+            | Err(CoreDeviceTunnelAttemptError::Tunnel(error)) => return Err(error),
+        }
+    };
+
+    let client_ip: std::net::IpAddr = tunnel
+        .info
+        .client_address
+        .parse()
+        .map_err(|e| Error::Other(format!("Invalid tunnel client address: {e}")))?;
+    let server_ip: std::net::IpAddr = tunnel
+        .info
+        .server_address
+        .parse()
+        .map_err(|e| Error::Other(format!("Invalid tunnel server address: {e}")))?;
+    let rsd_port = tunnel.info.server_rsd_port;
+    let mtu = tunnel.info.mtu as usize;
+    let mss = mtu.saturating_sub(60);
+    log::info!("tvOS tunnel: negotiated MTU {mtu}, using MSS {mss}");
+
+    let raw = tunnel.into_inner();
+    let mut adapter = Adapter::new(Box::new(raw), client_ip, server_ip);
+    adapter.set_mss(mss);
+    let mut adapter_handle = adapter.to_async_handle();
+
+    let rsd_stream = adapter_handle
+        .connect(rsd_port)
+        .await
+        .map_err(|e| Error::Other(format!("RSD connection failed: {e}")))?;
+    let handshake = RsdHandshake::new(rsd_stream)
+        .await
+        .map_err(|e| Error::Other(format!("RSD handshake failed: {e}")))?;
+
+    Ok((adapter_handle, handshake))
 }
 
 async fn write_pairing_file(
@@ -994,22 +1125,6 @@ fn external_pairing_paths() -> Vec<PathBuf> {
     {
         let mut paths = Vec::new();
 
-        if let Some(home) = std::env::var_os("HOME") {
-            let pymobiledevice_dir = PathBuf::from(home).join(".pymobiledevice3");
-            if let Ok(entries) = std::fs::read_dir(pymobiledevice_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with("remote_") && name.ends_with(".plist"))
-                    {
-                        paths.push(path);
-                    }
-                }
-            }
-        }
-
         let native_dir = Path::new("/var/db/lockdown/RemotePairing");
         if let Ok(entries) = std::fs::read_dir(native_dir) {
             for entry in entries.flatten() {
@@ -1039,39 +1154,34 @@ fn external_pairing_candidates() -> Vec<(String, RpPairingFile)> {
             continue;
         };
 
-        if path.file_name().and_then(|name| name.to_str()) == Some("selfIdentity.plist") {
-            let peer_paths = path
-                .parent()
-                .map(|parent| parent.join("peers"))
-                .and_then(|directory| std::fs::read_dir(directory).ok())
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("plist"))
-                .collect::<Vec<_>>();
-            let peer_bytes = peer_paths
-                .iter()
-                .filter_map(|peer_path| std::fs::read(peer_path).ok())
-                .collect::<Vec<_>>();
-            let peer_refs = peer_bytes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let peer_paths = path
+            .parent()
+            .map(|parent| parent.join("peers"))
+            .and_then(|directory| std::fs::read_dir(directory).ok())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("plist"))
+            .collect::<Vec<_>>();
+        let peer_bytes = peer_paths
+            .iter()
+            .filter_map(|peer_path| std::fs::read(peer_path).ok())
+            .collect::<Vec<_>>();
+        let peer_refs = peer_bytes.iter().map(Vec::as_slice).collect::<Vec<_>>();
 
-            if let Ok(native_candidates) = native_pairing_candidates_from_bytes(&bytes, &peer_refs)
-            {
-                for (index, candidate) in native_candidates.into_iter().enumerate() {
-                    let source = if index == 0 {
-                        path.display().to_string()
-                    } else {
-                        peer_paths
-                            .get(index - 1)
-                            .map(|peer_path| peer_path.display().to_string())
-                            .unwrap_or_else(|| path.display().to_string())
-                    };
-                    candidates.push((source, candidate));
-                }
+        if let Ok(native_candidates) = native_pairing_candidates_from_bytes(&bytes, &peer_refs) {
+            for (index, candidate) in native_candidates.into_iter().enumerate() {
+                let source = if index == 0 {
+                    path.display().to_string()
+                } else {
+                    peer_paths
+                        .get(index - 1)
+                        .map(|peer_path| peer_path.display().to_string())
+                        .unwrap_or_else(|| path.display().to_string())
+                };
+                candidates.push((source, candidate));
             }
-        } else if let Ok(candidate) = external_pairing_file_from_bytes(&bytes) {
-            candidates.push((path.display().to_string(), candidate));
         }
     }
 
@@ -1176,10 +1286,12 @@ fn local_remote_pairing_identifier() -> Option<String> {
 fn external_pairing_file_from_bytes(bytes: &[u8]) -> Result<RpPairingFile, Error> {
     let source: plist::Dictionary = plist::from_bytes(bytes)?;
     let data_field = |names: &[&str]| {
-        names
-            .iter()
-            .find_map(|name| source.get(*name).and_then(plist::Value::as_data))
-            .map(|data| data.to_vec())
+        names.iter().find_map(|name| {
+            source
+                .get(*name)
+                .and_then(plist::Value::as_data)
+                .map(|data| data.to_vec())
+        })
     };
     let string_field = |names: &[&str]| {
         names
@@ -1570,6 +1682,28 @@ mod tests {
     }
 
     #[test]
+    fn core_device_transport_exposes_authenticated_device_kind() {
+        let mut device = Device::new_tvos(
+            "Apple TV".to_string(),
+            "Apple-TV".to_string(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Some(1234),
+            Some(1235),
+            std::env::temp_dir(),
+        );
+        device.apply_tvos_info(&TvosDeviceInfo {
+            udid: Some("00008110-000C25540CD1801E".to_string()),
+            ..Default::default()
+        });
+
+        let transport = device
+            .core_device_transport(std::env::temp_dir())
+            .unwrap();
+
+        assert_eq!(transport.kind(), DeviceTransport::CoreDevice);
+    }
+
+    #[test]
     fn transport_identifies_usb_and_unavailable_devices() {
         let mut usb = stub_device();
         usb.usbmuxd_device = Some(UsbmuxdDevice {
@@ -1654,7 +1788,7 @@ mod tests {
     }
 
     #[test]
-    fn external_pairing_record_import_supports_native_and_pymobiledevice_shapes() {
+    fn external_pairing_record_import_supports_native_shape() {
         let source = RpPairingFile::generate("external-record-test");
         let mut native = plist::Dictionary::new();
         native.insert(
@@ -1678,31 +1812,6 @@ mod tests {
         assert_eq!(imported_native.public_key_bytes(), source.public_key_bytes());
         assert_eq!(imported_native.alt_irk(), Some(&[7; 16][..]));
 
-        let mut pymobiledevice = plist::Dictionary::new();
-        pymobiledevice.insert(
-            "public_key".to_string(),
-            plist::Value::Data(source.public_key_bytes()),
-        );
-        pymobiledevice.insert(
-            "private_key".to_string(),
-            plist::Value::Data(source.private_key_bytes()),
-        );
-        pymobiledevice.insert(
-            "remote_unlock_host_key".to_string(),
-            plist::Value::String("host-key".to_string()),
-        );
-
-        let mut pymobiledevice_bytes = Vec::new();
-        plist::to_writer_xml(&mut pymobiledevice_bytes, &pymobiledevice).unwrap();
-        let imported_pymobiledevice = external_pairing_file_from_bytes(&pymobiledevice_bytes).unwrap();
-        assert_eq!(
-            imported_pymobiledevice.public_key_bytes(),
-            source.public_key_bytes()
-        );
-        assert_eq!(
-            imported_pymobiledevice.private_key_bytes(),
-            source.private_key_bytes()
-        );
     }
 
     #[test]
