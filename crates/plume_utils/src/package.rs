@@ -1,7 +1,8 @@
 use super::{Bundle, PlistInfoTrait};
 use crate::{Error, SignerApp, SignerOptions, cgbi};
+use plume_core::MobileProvision;
 use plist::Dictionary;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, fs, io::Read};
 use uuid::Uuid;
 use zip::ZipArchive;
@@ -182,12 +183,67 @@ impl Package {
         Ok(Bundle::new(app_dir)?)
     }
 
-    pub fn get_archive_based_on_path(&self, path: &PathBuf) -> Result<PathBuf, Error> {
-        if path.is_dir() {
-            self.clone().archive_package_bundle()
-        } else {
-            Ok(self.package_file.clone())
+    pub fn get_archive_based_on_path(&self, _path: &PathBuf) -> Result<PathBuf, Error> {
+        self.clone().archive_package_bundle()
+    }
+
+    pub fn validate_archive(path: &Path, require_profile: bool) -> Result<(), Error> {
+        let mut archive = ZipArchive::new(fs::File::open(path)?)?;
+        let app_prefix = (0..archive.len())
+            .filter_map(|index| archive.by_index(index).ok().map(|entry| entry.name().to_string()))
+            .find(|entry| {
+                entry.starts_with("Payload/")
+                    && entry.ends_with("/Info.plist")
+                    && entry.matches('/').count() == 2
+            })
+            .map(|entry| entry.trim_end_matches("/Info.plist").to_string())
+            .ok_or_else(|| Error::Other("Produced IPA has no application bundle".to_string()))?;
+
+        let signature = format!("{app_prefix}/_CodeSignature/CodeResources");
+        let mut signature_data = Vec::new();
+        let signature_valid = archive
+            .by_name(&signature)
+            .map_err(|error| Error::Other(format!("Unable to read produced IPA signature: {error}")))
+            .and_then(|mut entry| {
+                entry
+                    .read_to_end(&mut signature_data)
+                    .map_err(|error| Error::Other(format!("Unable to read produced IPA signature: {error}")))
+            })
+            .is_ok()
+            && !signature_data.is_empty();
+        if !signature_valid {
+            return Err(Error::Other(
+                "Produced IPA has no application code signature".to_string(),
+            ));
         }
+
+        if require_profile {
+            let profile = format!("{app_prefix}/embedded.mobileprovision");
+            let mut profile_data = Vec::new();
+            let profile_valid = archive
+                .by_name(&profile)
+                .map_err(|error| Error::Other(format!("Unable to read produced IPA profile: {error}")))
+                .and_then(|mut entry| {
+                    entry
+                        .read_to_end(&mut profile_data)
+                        .map_err(|error| Error::Other(format!("Unable to read produced IPA profile: {error}")))
+                })
+                .is_ok()
+                && !profile_data.is_empty();
+            if !profile_valid {
+                return Err(Error::Other(
+                    "Produced IPA has no embedded provisioning profile".to_string(),
+                ));
+            }
+            MobileProvision::load_with_bytes(profile_data)
+                .map_err(|error| {
+                    Error::Other(format!(
+                        "Produced IPA has an invalid provisioning profile: {error}"
+                    ))
+                })?;
+        }
+
+        Ok(())
     }
 
     fn archive_package_bundle(self) -> Result<PathBuf, Error> {
@@ -210,8 +266,10 @@ impl Package {
                 let name = entry_path
                     .strip_prefix(prefix)
                     .map_err(|_| Error::PackageInfoPlistMissing)?
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
 
                 if entry_path.is_file() {
                     zip.start_file(&name, options.clone())?;
@@ -292,5 +350,146 @@ impl Package {
 
         let new_settings = SignerOptions::new_for_app(app);
         *settings = new_settings;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn profile_bytes(marker: &str) -> Vec<u8> {
+        let mut entitlements = Dictionary::new();
+        entitlements.insert(
+            "application-identifier".to_string(),
+            plist::Value::String("L988J7YMK5.com.example.test".to_string()),
+        );
+
+        let mut profile = Dictionary::new();
+        profile.insert(
+            "Entitlements".to_string(),
+            plist::Value::Dictionary(entitlements),
+        );
+        profile.insert(
+            "ExpirationDate".to_string(),
+            plist::Value::Date(plist::Date::from(
+                SystemTime::now() + Duration::from_secs(3600),
+            )),
+        );
+        profile.insert(
+            "Platform".to_string(),
+            plist::Value::Array(vec![plist::Value::String("iOS".to_string())]),
+        );
+        profile.insert(
+            "ProvisionedDevices".to_string(),
+            plist::Value::Array(vec![plist::Value::String(
+                "00008110-000C25540CD1801E".to_string(),
+            )]),
+        );
+        profile.insert(
+            "DeveloperCertificates".to_string(),
+            plist::Value::Array(vec![plist::Value::Data(vec![0; 4])]),
+        );
+        profile.insert(
+            "TestMarker".to_string(),
+            plist::Value::String(marker.to_string()),
+        );
+
+        let mut plist_data = Vec::new();
+        plist::to_writer_xml(&mut plist_data, &profile).unwrap();
+        let mut data = b"CMS".to_vec();
+        data.extend(plist_data);
+        data
+    }
+
+    fn staged_package(tag: &str) -> Package {
+        let stage_dir = env::temp_dir().join(format!("plume_pkg_test_{tag}_{}", Uuid::new_v4()));
+        let app_dir = stage_dir.join("Payload").join("Test.app");
+        fs::create_dir_all(app_dir.join("Frameworks")).unwrap();
+        fs::write(app_dir.join("Info.plist"), b"plist").unwrap();
+        fs::create_dir_all(app_dir.join("_CodeSignature")).unwrap();
+        fs::write(
+            app_dir.join("_CodeSignature").join("CodeResources"),
+            b"signature",
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("embedded.mobileprovision"),
+            profile_bytes("old"),
+        )
+        .unwrap();
+        fs::write(app_dir.join("Frameworks").join("lib.dylib"), b"macho").unwrap();
+
+        Package {
+            package_file: stage_dir.join("stage.ipa"),
+            stage_payload_dir: stage_dir.join("Payload"),
+            stage_dir,
+            info_plist_dictionary: Dictionary::new(),
+            archive_entries: Vec::new(),
+            app_icon_data: None,
+        }
+    }
+
+    fn entry_names(archive: &PathBuf) -> Vec<String> {
+        let mut zip = ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
+        (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn archive_entries_are_separated_by_forward_slashes() {
+        let package = staged_package("separators");
+        let stage_dir = package.stage_dir.clone();
+
+        let archive = package.archive_package_bundle().unwrap();
+        let names = entry_names(&archive);
+
+        for name in &names {
+            assert!(
+                !name.contains('\\'),
+                "entry {name:?} uses a backslash separator"
+            );
+        }
+        assert!(
+            names.iter().any(|n| n == "Payload/Test.app/Info.plist"),
+            "no Info.plist at the depth a bundle id is read from, got {names:?}"
+        );
+
+        let second = names.get(1).expect("archive has more than one entry");
+        assert_eq!(
+            second.split('/').nth(1),
+            Some("Test.app"),
+            "second entry {second:?} does not name the app bundle"
+        );
+
+        fs::remove_dir_all(&stage_dir).ok();
+    }
+
+    #[test]
+    fn archiving_a_file_path_uses_the_modified_staged_payload() {
+        let package = staged_package("modified");
+        let stage_dir = package.stage_dir.clone();
+        let expected_profile = profile_bytes("new");
+        fs::write(
+            stage_dir.join("Payload/Test.app/embedded.mobileprovision"),
+            &expected_profile,
+        )
+        .unwrap();
+
+        let archive = package
+            .get_archive_based_on_path(&PathBuf::from("input.ipa"))
+            .unwrap();
+        let mut zip = ZipArchive::new(fs::File::open(&archive).unwrap()).unwrap();
+        let mut profile = Vec::new();
+        zip.by_name("Payload/Test.app/embedded.mobileprovision")
+            .unwrap()
+            .read_to_end(&mut profile)
+            .unwrap();
+
+        assert_eq!(profile, expected_profile);
+        assert_ne!(profile, profile_bytes("old"));
+        Package::validate_archive(&archive, true).unwrap();
+        fs::remove_dir_all(&stage_dir).ok();
     }
 }
