@@ -22,3 +22,8 @@ flate2.workspace = true
 plume_core = { path = "../plume_core", features = ["tweaks"] }
 plume_store = { path = "../plume_store" }
 decompress = { path = "../../3rdparty/decompress" }
+
+mdns-sd = "0.11"
+
+[dev-dependencies]
+env_logger.workspace = true
