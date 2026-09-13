@@ -69,8 +69,12 @@ pub struct DevicesArgs {
     #[arg(short = 't', long = "team", value_name = "TEAM_ID")]
     pub team_id: Option<String>,
     /// Filter by device platform (ios, tvos, watchos)
-    #[arg(long = "platform", value_name = "PLATFORM")]
-    pub platform: Option<String>,
+    #[arg(
+        long = "platform",
+        value_name = "PLATFORM",
+        value_parser = parse_platform
+    )]
+    pub platform: Option<DeveloperPlatform>,
 }
 
 #[derive(Debug, Args)]
@@ -84,6 +88,25 @@ pub struct RegisterDeviceArgs {
     /// Device name
     #[arg(short = 'n', long = "name", value_name = "NAME", required = true)]
     pub name: String,
+    #[arg(
+        long = "platform",
+        value_name = "PLATFORM",
+        value_parser = parse_platform,
+        default_value_t = DeveloperPlatform::Ios
+    )]
+    pub platform: DeveloperPlatform,
+}
+
+fn parse_platform(value: &str) -> std::result::Result<DeveloperPlatform, String> {
+    if value.eq_ignore_ascii_case("ios") || value.eq_ignore_ascii_case("iphoneos") {
+        std::result::Result::Ok(DeveloperPlatform::Ios)
+    } else if value.eq_ignore_ascii_case("tvos") || value.eq_ignore_ascii_case("appletvos") {
+        std::result::Result::Ok(DeveloperPlatform::Tvos)
+    } else {
+        Err(format!(
+            "unsupported platform {value:?}; expected ios or tvos"
+        ))
+    }
 }
 
 #[derive(Debug, Args)]
@@ -272,7 +295,7 @@ async fn devices(args: DevicesArgs) -> Result<()> {
     };
 
     let p = session
-        .qh_list_devices(&team_id, DeveloperPlatform::Ios)
+        .qh_list_devices(&team_id, args.platform.unwrap_or_default())
         .await?
         .devices;
 
@@ -291,7 +314,7 @@ async fn register_device(args: RegisterDeviceArgs) -> Result<()> {
     };
 
     let p = session
-        .qh_add_device(&team_id, &args.name, &args.udid, DeveloperPlatform::Ios)
+        .qh_add_device(&team_id, &args.name, &args.udid, args.platform)
         .await?
         .device;
 

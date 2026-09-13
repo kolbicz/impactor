@@ -9,9 +9,11 @@ repository.workspace = true
 
 [dependencies]
 idevice.workspace = true
+base64.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 plist.workspace = true
+serde.workspace = true
 tokio.workspace = true
 futures.workspace = true
 log.workspace = true

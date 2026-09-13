@@ -1,16 +1,25 @@
 use std::fmt;
+use std::future::Future;
+#[cfg(target_os = "macos")]
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+#[cfg(not(target_os = "macos"))]
+use std::pin::Pin;
+use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use idevice::core_device_proxy::CoreDeviceProxy;
 use idevice::installation_proxy::InstallationProxyClient;
 use idevice::lockdown::LockdownClient;
 use idevice::misagent::MisagentClient;
 use idevice::provider::UsbmuxdProvider;
 use idevice::remote_pairing::{
-    RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native,
+    connect_tls_psk_tunnel_native, RemotePairingClient, RpPairingFile, RpPairingSocket,
+    RpPairingSocketProvider,
 };
+#[cfg(not(target_os = "macos"))]
 use idevice::remote_pairing::errors::RemotePairingError;
 use idevice::rsd::RsdHandshake;
 use idevice::tcp::adapter::Adapter;
@@ -21,17 +30,22 @@ use idevice::{IdeviceService, RemoteXpcClient, RsdService};
 use plume_core::{MobileProvision, developer::DeveloperPlatform};
 
 use crate::Error;
+use crate::discovery::{DeviceDiscovery, DeviceType, PlatformDiscovery, REMOTEPAIRING_SERVICE};
 use crate::options::SignerAppReal;
+#[cfg(not(target_os = "macos"))]
 use crate::pairing::{PairingBackend, PairingFailure, PairingStage, ensure_pairing};
 use idevice::afc::opcode::AfcFopenMode;
 use idevice::house_arrest::HouseArrestClient;
 use idevice::usbmuxd::UsbmuxdConnection;
 use plist::Value;
+#[cfg(not(target_os = "macos"))]
+use serde::Serialize;
 
 pub const CONNECTION_LABEL: &str = "plume_info";
 pub const INSTALLATION_LABEL: &str = "plume_install";
 pub const HOUSE_ARREST_LABEL: &str = "plume_house_arrest";
 
+#[cfg(not(target_os = "macos"))]
 impl<'a, R: idevice::remote_pairing::RpPairingSocketProvider> PairingBackend
     for RemotePairingClient<'a, R>
 {
@@ -62,6 +76,286 @@ impl<'a, R: idevice::remote_pairing::RpPairingSocketProvider> PairingBackend
             error => PairingFailure::Protocol(error.to_string()),
         })
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug)]
+struct SequencedTvosPairingSocket {
+    inner: RpPairingSocket<tokio::net::TcpStream>,
+    sequence_offset: usize,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl SequencedTvosPairingSocket {
+    fn new(inner: RpPairingSocket<tokio::net::TcpStream>, sequence_offset: usize) -> Self {
+        Self {
+            inner,
+            sequence_offset,
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl RpPairingSocketProvider for SequencedTvosPairingSocket {
+    fn send_plain(
+        &mut self,
+        value: impl Serialize,
+        seq: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<(), idevice::IdeviceError>> + Send + '_>> {
+        self.inner.send_plain(value, seq + self.sequence_offset)
+    }
+
+    fn send_encrypted(
+        &mut self,
+        ciphertext: Vec<u8>,
+        seq: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<(), idevice::IdeviceError>> + Send + '_>> {
+        self.inner
+            .send_encrypted(ciphertext, seq + self.sequence_offset)
+    }
+
+    fn recv_plain<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<plist::Value, idevice::IdeviceError>> + Send + 'a>> {
+        self.inner.recv_plain()
+    }
+
+    fn serialize_bytes(b: &[u8]) -> plist::Value {
+        RpPairingSocket::<tokio::net::TcpStream>::serialize_bytes(b)
+    }
+
+    fn deserialize_bytes(v: plist::Value) -> Option<Vec<u8>> {
+        RpPairingSocket::<tokio::net::TcpStream>::deserialize_bytes(v)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+struct TvosPairingBackend<'a> {
+    client: RemotePairingClient<'a, SequencedTvosPairingSocket>,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl<'a> PairingBackend for TvosPairingBackend<'a> {
+    async fn verify(&mut self) -> Result<(), PairingFailure> {
+        self.client
+            .attempt_pair_verify()
+            .await
+            .map_err(|error| PairingFailure::Protocol(error.to_string()))?;
+        self.client
+            .validate_pairing()
+            .await
+            .map_err(|error| PairingFailure::Protocol(error.to_string()))
+    }
+
+    async fn pair(&mut self, pin: &str) -> Result<(), PairingFailure> {
+        let pin = pin.to_string();
+        RemotePairingClient::pair(
+            &mut self.client,
+            |_| {
+                let pin = pin.clone();
+                async move { pin }
+            },
+            (),
+        )
+        .await
+        .map_err(|error| match error {
+            idevice::IdeviceError::RemotePairing(RemotePairingError::SrpAuthFailed) => {
+                PairingFailure::WrongPin
+            }
+            error => PairingFailure::Protocol(error.to_string()),
+        })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+const TVOS_RP_PAIRING_WIRE_PROTOCOL_VERSION: i64 = 26;
+
+#[cfg(not(target_os = "macos"))]
+async fn begin_tvos_pairing(
+    stream: tokio::net::TcpStream,
+) -> Result<SequencedTvosPairingSocket, Error> {
+    let correlation_identifier: String = uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(6)
+        .collect();
+    let mut socket = RpPairingSocket::new(stream);
+    socket
+        .send_plain(tvos_pairing_handshake_request(&correlation_identifier), 0)
+        .await?;
+    let response = socket.recv_plain().await?;
+    if !tvos_pairing_handshake_allows_pair_setup(&response) {
+        return Err(Error::Other(
+            "Apple TV did not advertise support for manual pairing".to_string(),
+        ));
+    }
+    Ok(SequencedTvosPairingSocket::new(socket, 1))
+}
+
+#[cfg(target_os = "macos")]
+async fn pair_tvos_with_devicectl<F, Fut>(
+    device_name: &str,
+    pin_provider: F,
+    address: Option<(std::net::IpAddr, u16)>,
+    cache_dir: &Path,
+    cache_path: &Path,
+) -> Result<RpPairingFile, Error>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = String>,
+{
+    let (pin_sender, pin_receiver) = std::sync::mpsc::sync_channel::<String>(1);
+    let device_name = device_name.to_string();
+    let mut pairing_task = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut child = std::process::Command::new("xcrun")
+            .args([
+                "devicectl",
+                "manage",
+                "pair",
+                "--device",
+                device_name.as_str(),
+                "--timeout",
+                "180",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Could not start xcrun devicectl: {error}"))?;
+
+        let pin = loop {
+            match pin_receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(pin) => break pin,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(status) = child
+                        .try_wait()
+                        .map_err(|error| format!("Could not check xcrun devicectl: {error}"))?
+                    {
+                        if status.success() {
+                            return Ok(());
+                        }
+                        return Err(format!(
+                            "xcrun devicectl pairing failed with status {status}"
+                        ));
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("Apple TV pairing PIN was not provided".to_string());
+                }
+            }
+        };
+        if pin.is_empty() {
+            let _ = child.kill();
+            return Err("Apple TV pairing was cancelled".to_string());
+        }
+        if pin.len() != 6 || !pin.bytes().all(|byte| byte.is_ascii_digit()) {
+            let _ = child.kill();
+            return Err("Apple TV pairing PIN must contain exactly six digits".to_string());
+        }
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "xcrun devicectl did not expose standard input".to_string())?;
+        stdin
+            .write_all(format!("{pin}\n").as_bytes())
+            .map_err(|error| format!("Could not provide the Apple TV pairing PIN: {error}"))?;
+        drop(stdin);
+
+        let status = child
+            .wait()
+            .map_err(|error| format!("Could not wait for xcrun devicectl: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("xcrun devicectl pairing failed with status {status}"))
+        }
+    });
+
+    let pin_future = pin_provider();
+    tokio::pin!(pin_future);
+    let pairing_result = tokio::select! {
+        result = &mut pairing_task => result,
+        pin = &mut pin_future => {
+            if pin_sender.send(pin).is_err() {
+                return Err(Error::Other(
+                    "xcrun devicectl exited before the Apple TV pairing PIN was provided".to_string(),
+                ));
+            }
+            pairing_task.await
+        }
+    };
+    pairing_result
+        .map_err(|error| Error::Other(format!("Apple TV pairing task failed: {error}")))?
+        .map_err(Error::Other)?;
+
+    try_import_external_pairing_at(address, cache_dir, cache_path)
+        .await?
+        .ok_or_else(|| {
+            Error::Other(
+                "Apple TV pairing completed in Xcode but its pairing record could not be imported"
+                    .to_string(),
+            )
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tvos_pairing_handshake_request(correlation_identifier: &str) -> Value {
+    let mut host_options = plist::Dictionary::new();
+    host_options.insert("attemptPairVerify".to_string(), Value::Boolean(false));
+
+    let mut correlation = plist::Dictionary::new();
+    correlation.insert(
+        "value".to_string(),
+        Value::String(correlation_identifier.to_string()),
+    );
+
+    let mut handshake = plist::Dictionary::new();
+    handshake.insert("hostOptions".to_string(), Value::Dictionary(host_options));
+    handshake.insert(
+        "correlationIdentifier".to_string(),
+        Value::Dictionary(correlation),
+    );
+    handshake.insert(
+        "wireProtocolVersion".to_string(),
+        Value::Integer(TVOS_RP_PAIRING_WIRE_PROTOCOL_VERSION.into()),
+    );
+
+    let mut handshake_container = plist::Dictionary::new();
+    handshake_container.insert("_0".to_string(), Value::Dictionary(handshake));
+
+    let mut request = plist::Dictionary::new();
+    request.insert(
+        "handshake".to_string(),
+        Value::Dictionary(handshake_container),
+    );
+
+    let mut request_container = plist::Dictionary::new();
+    request_container.insert("_0".to_string(), Value::Dictionary(request));
+
+    let mut root = plist::Dictionary::new();
+    root.insert("request".to_string(), Value::Dictionary(request_container));
+    Value::Dictionary(root)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tvos_pairing_handshake_allows_pair_setup(response: &Value) -> bool {
+    response
+        .as_dictionary()
+        .and_then(|value| value.get("response"))
+        .and_then(Value::as_dictionary)
+        .and_then(|value| value.get("_1"))
+        .and_then(Value::as_dictionary)
+        .and_then(|value| value.get("handshake"))
+        .and_then(Value::as_dictionary)
+        .and_then(|value| value.get("_0"))
+        .and_then(Value::as_dictionary)
+        .and_then(|value| value.get("deviceOptions"))
+        .and_then(Value::as_dictionary)
+        .and_then(|value| value.get("allowsPairSetup"))
+        .and_then(Value::as_boolean)
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +564,22 @@ impl Device {
         reconnect_port: Option<u16>,
         cache_dir: PathBuf,
     ) -> Self {
+        Self::new_tvos_with_addresses(
+            name,
+            pairing_identity,
+            pairing_port.map(|port| (ip, port)),
+            reconnect_port.map(|port| (ip, port)),
+            cache_dir,
+        )
+    }
+
+    pub fn new_tvos_with_addresses(
+        name: String,
+        pairing_identity: String,
+        pairing_address: Option<(std::net::IpAddr, u16)>,
+        reconnect_address: Option<(std::net::IpAddr, u16)>,
+        cache_dir: PathBuf,
+    ) -> Self {
         Device {
             name,
             udid: String::new(),
@@ -280,8 +590,8 @@ impl Device {
             device_id: 0,
             usbmuxd_device: None,
             is_mac: false,
-            pairing_address: pairing_port.map(|port| (ip, port)),
-            reconnect_address: reconnect_port.map(|port| (ip, port)),
+            pairing_address,
+            reconnect_address,
             pairing_identity: Some(pairing_identity),
             pairing_cache_dir: Some(cache_dir),
             core_device_authenticated: false,
@@ -618,7 +928,7 @@ impl Device {
     }
 
     pub async fn pair_tvos<F, Fut>(
-        &self,
+        &mut self,
         pin_provider: F,
         cache_dir: PathBuf,
     ) -> Result<RpPairingFile, Error>
@@ -648,7 +958,7 @@ impl Device {
             if let Some(pairing_file) =
                 self.try_import_external_pairing(&cache_dir, &cache_path).await?
             {
-                return Ok(pairing_file);
+                return self.finish_tvos_pairing(pairing_file).await;
             }
         }
 
@@ -686,7 +996,7 @@ impl Device {
             if reconnect_result.is_ok() {
                 write_pairing_file(&pairing_file, &cache_dir, &cache_path).await?;
                 log::info!("tvOS pairing: cached record reconnected without a PIN");
-                return Ok(pairing_file);
+                return self.finish_tvos_pairing(pairing_file).await;
             }
 
             if cache_path.exists() {
@@ -700,10 +1010,26 @@ impl Device {
                 self.try_import_external_pairing(&cache_dir, &cache_path).await?
             {
                 log::info!("tvOS pairing: recovered an existing native pairing record");
-                return Ok(pairing_file);
+                return self.finish_tvos_pairing(pairing_file).await;
             }
         }
 
+        #[cfg(target_os = "macos")]
+        {
+            let pairing_file = pair_tvos_with_devicectl(
+                &self.name,
+                pin_provider,
+                self.reconnect_address.or(self.pairing_address),
+                &cache_dir,
+                &cache_path,
+            )
+            .await?;
+            log::info!("tvOS pairing: imported the native Xcode pairing record");
+            return self.finish_tvos_pairing(pairing_file).await;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
         let (ip, port) = self.pairing_address.ok_or_else(|| {
             Error::Other(
                 "Apple TV pairing requires its manual-pairing service. On the Apple TV, open Settings \
@@ -724,21 +1050,18 @@ impl Device {
         })?;
         log::info!("tvOS pairing: TCP connected to {addr}, starting RPPairing handshake");
 
-        let conn = RpPairingSocket::new(stream);
-        let (mut pairing_file, sending_host) = {
-            let suffix: String = uuid::Uuid::new_v4()
-                .simple()
-                .to_string()
-                .chars()
-                .take(6)
-                .collect();
-            let host = format!("plume-{suffix}");
-            (RpPairingFile::generate(&host), host)
+        let local_hostname = local_remote_pairing_hostname().ok_or_else(|| {
+            Error::Other("Could not determine the Mac hostname for Apple TV pairing".to_string())
+        })?;
+        let sending_host = local_remote_pairing_host().unwrap_or_else(|| local_hostname.clone());
+        let mut pairing_file = RpPairingFile::generate(&local_hostname);
+        let conn = begin_tvos_pairing(stream).await?;
+        let pairing_client = RemotePairingClient::new(conn, &sending_host, &mut pairing_file);
+        let mut pairing_backend = TvosPairingBackend {
+            client: pairing_client,
         };
-
-        let mut pairing_client = RemotePairingClient::new(conn, &sending_host, &mut pairing_file);
         let stage = ensure_pairing(
-            &mut pairing_client,
+            &mut pairing_backend,
             false,
             true,
             false,
@@ -755,7 +1078,72 @@ impl Device {
 
         write_pairing_file(&pairing_file, &cache_dir, &cache_path).await?;
 
+        self.finish_tvos_pairing(pairing_file).await
+        }
+    }
+
+    async fn finish_tvos_pairing(
+        &mut self,
+        pairing_file: RpPairingFile,
+    ) -> Result<RpPairingFile, Error> {
+        self.refresh_tvos_reconnect_address(Duration::from_secs(5))
+            .await?;
         Ok(pairing_file)
+    }
+
+    pub async fn refresh_tvos_reconnect_address(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        let pairing_identity = self
+            .pairing_identity
+            .as_deref()
+            .filter(|identity| !identity.is_empty())
+            .map(str::to_ascii_lowercase);
+        let known_ip = self
+            .pairing_address
+            .or(self.reconnect_address)
+            .map(|(ip, _)| ip);
+
+        let discovered = PlatformDiscovery::new().discover(timeout).await?;
+        let candidate = discovered
+            .into_iter()
+            .filter(|device| {
+                device.device_type == DeviceType::AppleTV
+                    && device.service_type == REMOTEPAIRING_SERVICE
+            })
+            .filter_map(|device| {
+                let ip = device.ip_address.as_deref()?.parse().ok()?;
+                let port = device.port?;
+                let same_ip = known_ip == Some(ip);
+                let same_identity = pairing_identity.as_deref().is_some_and(|identity| {
+                    device.hostname.eq_ignore_ascii_case(identity)
+                        || device.name.eq_ignore_ascii_case(identity)
+                });
+                let same_name = !self.name.is_empty()
+                    && device.name.eq_ignore_ascii_case(&self.name);
+                if !(same_ip || same_identity || same_name) {
+                    return None;
+                }
+                Some(((same_ip, same_identity, same_name), (ip, port)))
+            })
+            .max_by_key(|(matches, _)| *matches)
+            .map(|(_, address)| address);
+
+        if let Some(address) = candidate {
+            self.reconnect_address = Some(address);
+            log::info!(
+                "tvOS pairing: using verified reconnect service at {}:{}",
+                address.0,
+                address.1
+            );
+            return Ok(());
+        }
+
+        Err(Error::Other(
+            "Apple TV pairing succeeded, but its verified _remotepairing._tcp service was not found; scan again and retry"
+                .to_string(),
+        ))
     }
 
     pub async fn establish_tvos_tunnel(
@@ -772,14 +1160,69 @@ impl Device {
     }
 
     pub fn has_pairing_source(&self, cache_dir: &Path) -> bool {
-        self.has_cached_pairing_file(cache_dir)
-            || external_pairing_paths()
-                .into_iter()
-                .any(|path| path.exists())
+        if self.has_cached_pairing_file(cache_dir) {
+            return true;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            return self.has_native_tvos_pairing();
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        false
     }
 
     pub async fn forget_tvos_pairing(&self, cache_dir: PathBuf) -> Result<(), Error> {
         let path = self.pairing_cache_path(&cache_dir)?;
+
+        #[cfg(target_os = "macos")]
+        if self.has_native_tvos_pairing() {
+            let selector = if crate::is_valid_device_udid(&self.udid) {
+                self.udid.clone()
+            } else if let Some(identity) = self
+                .pairing_identity
+                .as_deref()
+                .filter(|identity| !identity.is_empty())
+            {
+                identity.to_string()
+            } else {
+                self.name.clone()
+            };
+            let output = std::process::Command::new("xcrun")
+                .args([
+                    "devicectl",
+                    "manage",
+                    "unpair",
+                    "--device",
+                    selector.as_str(),
+                    "--timeout",
+                    "45",
+                ])
+                .output()
+                .map_err(|error| {
+                    Error::Other(format!("Could not run xcrun devicectl unpair: {error}"))
+                })?;
+            if !output.status.success() {
+                let details = String::from_utf8_lossy(&output.stderr)
+                    .trim()
+                    .to_string();
+                let details = if details.is_empty() {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                } else {
+                    details
+                };
+                return Err(Error::Other(format!(
+                    "Could not remove the native Apple TV pairing: {}",
+                    if details.is_empty() {
+                        output.status.to_string()
+                    } else {
+                        details
+                    }
+                )));
+            }
+        }
+
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -790,6 +1233,56 @@ impl Device {
     pub async fn fetch_tvos_info(&self, cache_dir: PathBuf) -> Result<TvosDeviceInfo, Error> {
         let (_adapter, handshake) = self.establish_tvos_tunnel(cache_dir).await?;
         Ok(TvosDeviceInfo::from_rsd_properties(&handshake.properties))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn has_native_tvos_pairing(&self) -> bool {
+        let expected_name = self.name.to_ascii_lowercase();
+        let expected_product_type = self
+            .product_type
+            .as_deref()
+            .map(str::to_ascii_lowercase);
+
+        for host_path in external_pairing_paths() {
+            let Some(peers_path) = host_path.parent().map(|path| path.join("peers")) else {
+                continue;
+            };
+            let Ok(entries) = std::fs::read_dir(peers_path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("plist") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue;
+                };
+                let Ok(peer) = plist::from_bytes::<plist::Dictionary>(&bytes) else {
+                    continue;
+                };
+                let model = peer
+                    .get("model")
+                    .and_then(Value::as_string)
+                    .map(str::to_ascii_lowercase);
+                let name = peer
+                    .get("name")
+                    .and_then(Value::as_string)
+                    .map(str::to_ascii_lowercase);
+                let model_matches = model.as_deref().is_some_and(|model| {
+                    model.starts_with("appletv")
+                        && expected_product_type
+                            .as_deref()
+                            .is_none_or(|expected| expected == model)
+                });
+                let name_matches = name.as_deref() == Some(expected_name.as_str());
+                if model_matches && name_matches {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     pub fn apply_tvos_info(&mut self, info: &TvosDeviceInfo) {
@@ -953,6 +1446,61 @@ enum CoreDeviceTunnelAttemptError {
     Tunnel(Error),
 }
 
+fn tvos_create_listener_request(encryption_key: &[u8]) -> Value {
+    let mut listener = plist::Dictionary::new();
+    listener.insert(
+        "key".to_string(),
+        Value::String(STANDARD.encode(encryption_key)),
+    );
+
+    let mut peer_connection = plist::Dictionary::new();
+    peer_connection.insert(
+        "owningPID".to_string(),
+        Value::Integer((std::process::id() as i64).into()),
+    );
+    peer_connection.insert(
+        "owningProcessName".to_string(),
+        Value::String("CoreDeviceService".to_string()),
+    );
+    listener.insert(
+        "peerConnectionsInfo".to_string(),
+        Value::Array(vec![Value::Dictionary(peer_connection)]),
+    );
+    listener.insert(
+        "transportProtocolType".to_string(),
+        Value::String("tcp".to_string()),
+    );
+
+    let mut operation = plist::Dictionary::new();
+    operation.insert("createListener".to_string(), Value::Dictionary(listener));
+
+    let mut request_body = plist::Dictionary::new();
+    request_body.insert("_0".to_string(), Value::Dictionary(operation));
+
+    let mut request = plist::Dictionary::new();
+    request.insert("request".to_string(), Value::Dictionary(request_body));
+    Value::Dictionary(request)
+}
+
+async fn create_tvos_tcp_listener<R: RpPairingSocketProvider>(
+    rpc: &mut RemotePairingClient<'_, R>,
+) -> Result<u16, Error> {
+    let request = tvos_create_listener_request(rpc.encryption_key());
+    let response = rpc.send_receive_encrypted_request(request).await?;
+    log::debug!("tvOS createListener response: {response:#?}");
+
+    let port = response
+        .as_dictionary()
+        .and_then(|value| value.get("createListener"))
+        .and_then(Value::as_dictionary)
+        .and_then(|value| value.get("port"))
+        .and_then(Value::as_unsigned_integer)
+        .filter(|port| *port <= u16::MAX as u64)
+        .ok_or_else(|| Error::Other("missing port in createListener response".to_string()))?;
+
+    Ok(port as u16)
+}
+
 async fn establish_core_device_tunnel(
     pairing_address: Option<(std::net::IpAddr, u16)>,
     reconnect_address: Option<(std::net::IpAddr, u16)>,
@@ -960,9 +1508,16 @@ async fn establish_core_device_tunnel(
     udid: &str,
     cache_dir: &Path,
 ) -> Result<(AdapterHandle, RsdHandshake), Error> {
-    let (ip, port) = reconnect_address
-        .or(pairing_address)
-        .ok_or_else(|| Error::Other("Device has no network address".to_string()))?;
+    let (ip, port) = reconnect_address.ok_or_else(|| {
+        if pairing_address.is_some() {
+            Error::Other(
+                "Apple TV has only its manual-pairing service; discover its verified _remotepairing._tcp service before opening a tunnel"
+                    .to_string(),
+            )
+        } else {
+            Error::Other("Device has no network address".to_string())
+        }
+    })?;
 
     let connect_addr = std::net::SocketAddr::new(ip, port);
     let cache_path = pairing_cache_path_for(pairing_identity, udid, cache_dir)?;
@@ -1007,7 +1562,7 @@ async fn establish_core_device_tunnel(
                 )));
             }
 
-            let tunnel_port = rpc.create_tcp_listener().await.map_err(|e| {
+            let tunnel_port = create_tvos_tcp_listener(&mut rpc).await.map_err(|e| {
                 CoreDeviceTunnelAttemptError::Tunnel(Error::Other(format!(
                     "Failed to create tunnel listener: {e}"
                 )))
@@ -1241,6 +1796,7 @@ fn pairing_action(
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn pairing_failure_to_error(failure: PairingFailure) -> Error {
     match failure {
         PairingFailure::Cancelled => Error::Other("Apple TV pairing was cancelled".to_string()),
@@ -1262,7 +1818,7 @@ fn pairing_failure_to_error(failure: PairingFailure) -> Error {
     }
 }
 
-fn local_remote_pairing_identifier() -> Option<String> {
+fn local_remote_pairing_hostname() -> Option<String> {
     let hostname = std::env::var("HOSTNAME")
         .ok()
         .filter(|hostname| !hostname.trim().is_empty())
@@ -1276,6 +1832,24 @@ fn local_remote_pairing_identifier() -> Option<String> {
                 .filter(|hostname| !hostname.is_empty())
         })?;
 
+    Some(hostname)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn local_remote_pairing_host() -> Option<String> {
+    std::process::Command::new("scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|hostname| hostname.trim().to_string())
+        .filter(|hostname| !hostname.is_empty())
+        .or_else(local_remote_pairing_hostname)
+}
+
+fn local_remote_pairing_identifier() -> Option<String> {
+    let hostname = local_remote_pairing_hostname()?;
     Some(
         uuid::Uuid::new_v3(&uuid::Uuid::NAMESPACE_DNS, hostname.as_bytes())
             .to_string()
@@ -1343,7 +1917,7 @@ fn get_app_name_from_info(info: &Value) -> Option<String> {
 impl fmt::Display for Device {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let conn = if self.pairing_address.is_some() || self.reconnect_address.is_some() {
-            "WiFi (tvOS)"
+            "WiFi"
         } else {
             match &self.usbmuxd_device {
                 Some(device) => match &device.connection_type {
@@ -1361,7 +1935,8 @@ impl fmt::Display for Device {
         } else {
             String::new()
         };
-        write!(f, "[{conn}] {}{identity}", self.name)
+        let platform = if self.is_tvos() { " (tvOS)" } else { "" };
+        write!(f, "[{conn}] {}{platform}{identity}", self.name)
     }
 }
 
@@ -1536,6 +2111,24 @@ mod tests {
 
         let info = TvosDeviceInfo::from_rsd_properties(&props);
         assert_eq!(info.os_version.as_deref(), Some("26.5"));
+    }
+
+    #[test]
+    fn display_keeps_tvos_platform_out_of_connection_brackets() {
+        let mut device = Device::new_tvos(
+            "Apple TV".to_string(),
+            "Apple-TV".to_string(),
+            "192.0.2.10".parse().unwrap(),
+            None,
+            Some(49152),
+            std::env::temp_dir(),
+        );
+        device.udid = "00008110-000C25540CD1801E".to_string();
+
+        assert_eq!(
+            device.to_string(),
+            "[WiFi] Apple TV (tvOS) [00008110…801E]"
+        );
     }
 
     #[test]
@@ -1875,6 +2468,49 @@ mod tests {
         assert!(pairing_action(false, false, true)
             .unwrap_err()
             .contains("manual-pairing"));
+    }
+
+    #[test]
+    fn tvos_listener_request_contains_coredevice_connection_metadata() {
+        let request = tvos_create_listener_request(&[0, 1, 2, 255]);
+        let listener = request
+            .as_dictionary()
+            .and_then(|value| value.get("request"))
+            .and_then(Value::as_dictionary)
+            .and_then(|value| value.get("_0"))
+            .and_then(Value::as_dictionary)
+            .and_then(|value| value.get("createListener"))
+            .and_then(Value::as_dictionary)
+            .expect("createListener request");
+
+        assert_eq!(
+            listener
+                .get("key")
+                .and_then(Value::as_string)
+                .unwrap(),
+            "AAEC/w=="
+        );
+        assert_eq!(
+            listener
+                .get("transportProtocolType")
+                .and_then(Value::as_string),
+            Some("tcp")
+        );
+
+        let peers = listener
+            .get("peerConnectionsInfo")
+            .and_then(Value::as_array)
+            .expect("peer connection metadata");
+        assert_eq!(peers.len(), 1);
+        let peer = peers[0].as_dictionary().expect("peer connection");
+        assert_eq!(
+            peer.get("owningProcessName").and_then(Value::as_string),
+            Some("CoreDeviceService")
+        );
+        assert_eq!(
+            peer.get("owningPID").and_then(Value::as_unsigned_integer),
+            Some(std::process::id() as u64)
+        );
     }
 
     #[cfg(unix)]

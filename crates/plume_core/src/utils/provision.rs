@@ -366,7 +366,11 @@ fn application_identifier_grants(granted: &str, requested: &str) -> bool {
 
     granted_bundle_id
         .strip_suffix(".*")
-        .is_some_and(|prefix| requested.starts_with(prefix) && requested.len() > prefix.len())
+        .is_some_and(|prefix| {
+            requested
+                .strip_prefix(prefix)
+                .is_some_and(|remainder| remainder.starts_with('.'))
+        })
 }
 
 fn application_identifier_bundle_id(value: &str) -> Option<&str> {
@@ -800,6 +804,18 @@ mod tests {
         assert!(application_identifier_grants(
             "com.example.tv",
             "com.example.tv"
+        ));
+    }
+
+    #[test]
+    fn wildcard_application_identifier_requires_a_bundle_component_boundary() {
+        assert!(application_identifier_grants(
+            "L988J7YMK5.com.example.*",
+            "com.example.tv"
+        ));
+        assert!(!application_identifier_grants(
+            "L988J7YMK5.com.example.*",
+            "com.examples.tv"
         ));
     }
 }

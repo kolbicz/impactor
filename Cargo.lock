@@ -5673,6 +5673,7 @@ dependencies = [
 name = "plume_utils"
 version = "2.6.3-kolbicz.4"
 dependencies = [
+ "base64 0.22.1",
  "decompress",
  "env_logger",
  "flate2",
@@ -5685,6 +5686,7 @@ dependencies = [
  "plist",
  "plume_core",
  "plume_store",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
  "uuid",

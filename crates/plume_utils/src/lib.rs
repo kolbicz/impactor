@@ -9,6 +9,7 @@ mod signer;
 mod tweak;
 
 use std::path::Path;
+use idevice::usbmuxd::Connection;
 pub use bundle::{Bundle, BundleType};
 pub use device::{
     CoreDeviceTransport, Device, DeviceTransport, TvosDeviceInfo, get_device_for_id, install_app_mac,
@@ -120,6 +121,15 @@ fn dedup_keys_for_device(device: &Device) -> Vec<String> {
     }
     if let Some(usbmuxd) = &device.usbmuxd_device {
         keys.push(format!("mux:{}", usbmuxd.device_id));
+        if let Connection::Network(ip) = &usbmuxd.connection_type {
+            keys.push(format!("network-ip:{ip}"));
+        }
+    }
+    for address in [device.pairing_address, device.reconnect_address]
+        .into_iter()
+        .flatten()
+    {
+        keys.push(format!("network-ip:{}", address.0));
     }
 
     keys
@@ -201,7 +211,16 @@ fn merge_devices(existing: &mut Device, mut incoming: Device) {
     if existing.serial_number.is_none() {
         existing.serial_number = incoming.serial_number;
     }
-    if existing.usbmuxd_device.is_none() {
+    let is_remote_tvos = existing.pairing_identity.is_some()
+        && (existing
+            .product_type
+            .as_deref()
+            .is_some_and(|value| value.starts_with("AppleTV"))
+            || existing
+                .device_class
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("AppleTV")));
+    if existing.usbmuxd_device.is_none() && !is_remote_tvos {
         existing.usbmuxd_device = incoming.usbmuxd_device;
     }
     if existing.pairing_address.is_none() {
@@ -221,6 +240,9 @@ fn merge_devices(existing: &mut Device, mut incoming: Device) {
     }
     existing.is_mac |= incoming.is_mac;
     existing.core_device_authenticated |= incoming.core_device_authenticated;
+    if is_remote_tvos {
+        existing.usbmuxd_device = None;
+    }
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -341,5 +363,51 @@ mod tests {
         let devices = deduplicate_devices([first, second]);
 
         assert_eq!(devices.len(), 1);
+    }
+
+    #[test]
+    fn deduplicates_usbmuxd_apple_tv_with_authenticated_network_entry() {
+        let cache_dir = std::env::temp_dir();
+        let legacy = Device {
+            name: "TV".to_string(),
+            udid: "fff48:e1:5c:79:40:83fff".to_string(),
+            product_type: Some("AppleTV14,1".to_string()),
+            device_class: Some("AppleTV".to_string()),
+            os_version: Some("26.6".to_string()),
+            serial_number: None,
+            device_id: 237,
+            usbmuxd_device: Some(idevice::usbmuxd::UsbmuxdDevice {
+                connection_type: Connection::Network("192.0.2.10".parse().unwrap()),
+                udid: "fff48:e1:5c:79:40:83fff".to_string(),
+                device_id: 237,
+            }),
+            is_mac: false,
+            pairing_address: None,
+            reconnect_address: None,
+            pairing_identity: None,
+            pairing_cache_dir: None,
+            core_device_authenticated: false,
+        };
+        let mut authenticated = Device::new_tvos(
+            "TV".to_string(),
+            "tv".to_string(),
+            "192.0.2.10".parse().unwrap(),
+            None,
+            Some(49152),
+            cache_dir,
+        );
+        authenticated.udid = "00008110-000C25540CD1801E".to_string();
+        authenticated.product_type = Some("AppleTV14,1".to_string());
+        authenticated.os_version = Some("26.6".to_string());
+        authenticated.core_device_authenticated = true;
+
+        let devices = deduplicate_devices([legacy, authenticated]);
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "TV");
+        assert_eq!(devices[0].udid, "00008110-000C25540CD1801E");
+        assert!(devices[0].core_device_authenticated);
+        assert!(devices[0].usbmuxd_device.is_none());
+        assert_eq!(devices[0].transport(), DeviceTransport::CoreDevice);
     }
 }

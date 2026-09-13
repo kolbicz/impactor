@@ -196,11 +196,7 @@ pub(crate) fn build_device(
         name,
         hostname: short_hostname(hostname).to_string(),
         udid,
-        ip_address: addresses
-            .iter()
-            .find(|address| address.is_ipv4())
-            .or_else(|| addresses.first())
-            .map(|address| address.to_string()),
+        ip_address: preferred_ip_address(addresses),
         port,
         device_type,
         connection_type: ConnectionType::WiFi,
@@ -209,6 +205,15 @@ pub(crate) fn build_device(
         os_version,
         service_type: service_type.to_string(),
     }
+}
+
+fn preferred_ip_address(addresses: &[IpAddr]) -> Option<String> {
+    addresses
+        .iter()
+        .filter(|address| address.is_ipv4())
+        .min_by_key(|address| address.to_string())
+        .or_else(|| addresses.iter().min_by_key(|address| address.to_string()))
+        .map(ToString::to_string)
 }
 
 pub(crate) fn is_metadata_service(service_type: &str) -> bool {
@@ -267,9 +272,9 @@ pub(crate) fn enrich_and_filter(devices: Vec<DiscoveredDevice>) -> Vec<Discovere
 struct NetworkDeviceGroup {
     name: String,
     hostname: String,
-    ip: Option<IpAddr>,
-    pairing_port: Option<u16>,
-    reconnect_port: Option<u16>,
+    pairing_address: Option<(IpAddr, u16)>,
+    reconnect_address: Option<(IpAddr, u16)>,
+    legacy_core_device: bool,
 }
 
 pub fn group_network_devices(discovered: &[DiscoveredDevice], cache_dir: &Path) -> Vec<Device> {
@@ -297,31 +302,36 @@ pub fn group_network_devices(discovered: &[DiscoveredDevice], cache_dir: &Path) 
         let entry = groups.entry(key).or_insert_with(|| NetworkDeviceGroup {
             name: d.name.clone(),
             hostname: d.hostname.clone(),
-            ip: None,
-            pairing_port: None,
-            reconnect_port: None,
+            pairing_address: None,
+            reconnect_address: None,
+            legacy_core_device: false,
         });
+        entry.legacy_core_device |= is_core_device;
 
-        if entry.ip.is_none() {
-            if let Some(ip_str) = &d.ip_address {
-                if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                    entry.ip = Some(ip);
-                }
-            }
-        }
-
+        let address = d
+            .ip_address
+            .as_deref()
+            .and_then(|ip| ip.parse::<IpAddr>().ok())
+            .zip(d.port);
         if d.service_type == REMOTEPAIRING_MANUAL_PAIRING_SERVICE {
-            entry.pairing_port = d.port;
+            if entry.pairing_address.is_none() {
+                entry.pairing_address = address;
+            }
         } else if d.service_type == REMOTEPAIRING_SERVICE {
-            entry.reconnect_port = d.port;
+            if entry.reconnect_address.is_none() {
+                entry.reconnect_address = address;
+            }
         }
     }
 
     let mut devices = Vec::with_capacity(groups.len());
     for group in groups.into_values() {
-        let Some(ip) = group.ip else {
+        if group.pairing_address.is_none()
+            && group.reconnect_address.is_none()
+            && !group.legacy_core_device
+        {
             continue;
-        };
+        }
         let pairing_identity = if group.hostname.is_empty() {
             group.name.replace(' ', "-")
         } else {
@@ -329,12 +339,11 @@ pub fn group_network_devices(discovered: &[DiscoveredDevice], cache_dir: &Path) 
         };
         let id = synthetic_device_id(&pairing_identity);
 
-        let mut device = Device::new_tvos(
+        let mut device = Device::new_tvos_with_addresses(
             group.name,
             pairing_identity,
-            ip,
-            group.pairing_port,
-            group.reconnect_port,
+            group.pairing_address,
+            group.reconnect_address,
             cache_dir.to_path_buf(),
         );
         device.device_id = id;
@@ -1061,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn group_network_devices_keeps_first_resolved_address_when_entries_share_a_name() {
+    fn group_network_devices_keeps_each_service_address_when_entries_share_a_name() {
         let discovered = [
             network_apple_tv(
                 "Living Room",
@@ -1081,7 +1090,7 @@ mod tests {
         );
         assert_eq!(
             devices[0].reconnect_address.unwrap().0.to_string(),
-            "10.0.0.5"
+            "10.0.0.9"
         );
     }
 }

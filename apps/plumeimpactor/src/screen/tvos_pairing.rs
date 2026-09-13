@@ -59,7 +59,7 @@ pub enum Message {
     PairComplete(Result<Device, String>),
     ReconnectComplete(Result<Device, String>),
     Forget,
-    ForgetComplete(Result<(), String>),
+    ForgetComplete(Result<Device, String>),
     StartOver,
 }
 
@@ -99,7 +99,7 @@ impl TvOsPairingScreen {
         } else {
             device.hostname.clone()
         };
-        format!("[WiFi (tvOS)] {} ({host})", device.name)
+        format!("[WiFi] {} (tvOS) ({host})", device.name)
     }
 
     fn selected_label(&self) -> Option<&str> {
@@ -237,7 +237,10 @@ impl TvOsPairingScreen {
                         return Task::none();
                     }
                 };
-                let reconnect_port = self.reconnect_entry().and_then(|d| d.port);
+                let reconnect_address = self.reconnect_entry().and_then(|device| {
+                    let ip = device.ip_address.as_deref()?.parse().ok()?;
+                    Some((ip, device.port?))
+                });
 
                 let name = dev.name.clone();
                 let hostname = Self::pairing_identity(dev);
@@ -259,12 +262,11 @@ impl TvOsPairingScreen {
                     let result = rt.block_on(async move {
                         let ip: std::net::IpAddr =
                             ip_str.parse().map_err(|e| format!("Invalid IP: {e}"))?;
-                        let mut device = Device::new_tvos(
+                        let mut device = Device::new_tvos_with_addresses(
                             name,
                             hostname,
-                            ip,
-                            Some(pairing_port),
-                            reconnect_port,
+                            Some((ip, pairing_port)),
+                            reconnect_address,
                             cache_dir.clone(),
                         );
                         device
@@ -452,30 +454,34 @@ impl TvOsPairingScreen {
             }
 
             Message::Forget => {
-                let Some(device) = self.selected_device().cloned() else {
-                    self.status = Some(StatusMessage::error("Select an Apple TV first."));
-                    return Task::none();
-                };
-                let identity = Self::pairing_identity(&device);
-                let name = device.name;
                 let cache_dir = get_data_path();
-                let device = Device::new_tvos(
-                    name,
-                    identity,
-                    "0.0.0.0".parse().unwrap(),
-                    None,
-                    None,
-                    cache_dir.clone(),
-                );
+                let device = if let Some(device) = self.paired_device.clone() {
+                    device
+                } else {
+                    let Some(discovered) = self.selected_device().cloned() else {
+                        self.status = Some(StatusMessage::error("Select an Apple TV first."));
+                        return Task::none();
+                    };
+                    let identity = Self::pairing_identity(&discovered);
+                    Device::new_tvos(
+                        discovered.name,
+                        identity,
+                        "0.0.0.0".parse().unwrap(),
+                        None,
+                        None,
+                        cache_dir.clone(),
+                    )
+                };
                 let (tx, rx) = std::sync::mpsc::sync_channel(1);
                 std::thread::spawn(move || {
                     let result = tokio::runtime::Runtime::new()
                         .unwrap()
                         .block_on(device.forget_tvos_pairing(cache_dir))
+                        .map(|_| device)
                         .map_err(|e| format!("{e}"));
                     let _ = tx.send(result);
                 });
-                self.status = Some(StatusMessage::info("Forgetting saved pairing..."));
+                self.status = Some(StatusMessage::info("Removing Apple TV pairing..."));
                 Task::perform(
                     async move {
                         std::thread::spawn(move || {
@@ -491,10 +497,11 @@ impl TvOsPairingScreen {
 
             Message::ForgetComplete(result) => {
                 match result {
-                    Ok(()) => {
+                    Ok(_) => {
                         self.paired_device = None;
-                        self.status =
-                            Some(StatusMessage::success("Saved pairing record forgotten."));
+                        self.status = Some(StatusMessage::success(
+                            "Host pairing removed. The Apple TV may reconnect without a PIN until its remote devices are forgotten.",
+                        ));
                     }
                     Err(error) => self.status = Some(StatusMessage::error(error)),
                 }
@@ -660,7 +667,8 @@ impl TvOsPairingScreen {
             text(
                 "This Apple TV is now selectable in the device list at the top of the window. \
                  To install to it, import an IPA from the main screen the same way you would \
-                 for any other device.",
+                 for any other device. Forgetting here removes Impactor's local pairing record; \
+                 use the Apple TV's Forget All Remote Devices option to require a new PIN.",
             )
             .size(13),
         );
@@ -678,7 +686,7 @@ impl TvOsPairingScreen {
                 .width(Fill),
         );
         content = content.push(
-            button(text("Forget Saved Pairing").align_x(Center))
+            button(text("Forget Host Pairing").align_x(Center))
                 .on_press(Message::Forget)
                 .style(appearance::s_button)
                 .width(Fill),

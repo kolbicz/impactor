@@ -41,6 +41,7 @@ pub enum Message {
     ComboBoxSelected(String),
     DeviceConnected(Device),
     DeviceDisconnected(u32),
+    DeviceForgotten(Device),
 
     // Tray
     TrayMenuClicked(tray_icon::menu::MenuId),
@@ -302,6 +303,28 @@ impl Impactor {
                     return Task::done(Message::UtilitiesScreen(utilties::Message::RefreshApps(
                         rppairing_enabled,
                     )));
+                }
+
+                Task::none()
+            }
+            Message::DeviceForgotten(device) => {
+                self.devices
+                    .retain(|candidate| !same_device_identity(candidate, &device));
+
+                if self
+                    .selected_device
+                    .as_ref()
+                    .is_some_and(|selected| same_device_identity(selected, &device))
+                {
+                    self.selected_device = self.devices.first().cloned();
+                }
+
+                if plume_utils::is_valid_device_udid(&device.udid) {
+                    if let Some(daemon_devices) = REFRESH_DAEMON_DEVICES.get() {
+                        if let Ok(mut devices) = daemon_devices.lock() {
+                            devices.remove(&device.udid);
+                        }
+                    }
                 }
 
                 Task::none()
@@ -832,9 +855,15 @@ impl Impactor {
                         }
                         _ => None,
                     };
+                    let forgotten_device = match &msg {
+                        tvos_pairing::Message::ForgetComplete(Ok(device)) => Some(device.clone()),
+                        _ => None,
+                    };
                     let update = screen.update(msg).map(Message::TvOsPairingScreen);
                     if let Some(device) = paired_device {
                         Task::batch([update, Task::done(Message::DeviceConnected(device))])
+                    } else if let Some(device) = forgotten_device {
+                        Task::batch([update, Task::done(Message::DeviceForgotten(device))])
                     } else {
                         update
                     }
