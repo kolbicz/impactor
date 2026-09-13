@@ -260,12 +260,6 @@ async fn discover_network_devices(timeout: Duration) -> Result<Vec<Device>> {
 async fn pair_connect(args: PairConnectArgs) -> Result<()> {
     let cache_dir = get_data_path();
     let mut device = if let Some(ip) = args.ip {
-        #[cfg(target_os = "macos")]
-        if args.name.is_none() {
-            return Err(anyhow!(
-                "--name is required with --ip on macOS so devicectl can select the Apple TV"
-            ));
-        }
         let name = args.name.unwrap_or_else(|| "Apple TV".to_string());
         let port = args
             .port

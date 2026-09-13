@@ -5675,7 +5675,6 @@ version = "2.6.3-kolbicz.4"
 dependencies = [
  "base64 0.22.1",
  "decompress",
- "env_logger",
  "flate2",
  "futures",
  "goblin",
