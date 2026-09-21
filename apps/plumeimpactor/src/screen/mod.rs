@@ -14,6 +14,7 @@ use iced::{Element, Subscription, Task};
 
 use plume_store::AccountStore;
 use plume_utils::{Device, SignerOptions};
+use rust_i18n::t;
 
 use crate::subscriptions;
 use crate::tray::ImpactorTray;
@@ -94,6 +95,7 @@ pub struct Impactor {
     pending_installation: bool,
     certificate_reset_queue: VecDeque<crate::certificate_reset::ConfirmationRequest>,
     selected_locale: Option<String>,
+    last_installer: Option<package::PackageScreen>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +147,7 @@ impl Impactor {
                 pending_installation: false,
                 certificate_reset_queue: VecDeque::new(),
                 selected_locale,
+                last_installer: None,
             },
             open_task,
         )
@@ -173,7 +176,7 @@ impl Impactor {
                 self.selected_device = self
                     .devices
                     .iter()
-                    .find(|d| d.to_string() == value)
+                    .find(|device| self.device_display_name(device) == value)
                     .cloned();
 
                 if let ImpactorScreen::Utilities(_) = self.current_screen {
@@ -195,7 +198,10 @@ impl Impactor {
                 if !self.devices.iter().any(|d| d.device_id == device.device_id) {
                     self.devices.push(device.clone());
 
-                    if self.selected_device.is_none() && device.device_id != u32::MAX {
+                    if self.selected_device.is_none()
+                        && device.device_id != u32::MAX
+                        && self.device_is_enabled(&device)
+                    {
                         self.selected_device = Some(device.clone());
                     }
                 }
@@ -231,7 +237,11 @@ impl Impactor {
                 self.devices.retain(|d| d.device_id != id);
 
                 if self.selected_device.as_ref().map(|d| d.device_id) == Some(id) {
-                    self.selected_device = self.devices.first().cloned();
+                    self.selected_device = self
+                        .devices
+                        .iter()
+                        .find(|device| self.device_is_enabled(device))
+                        .cloned();
                 }
 
                 if let (Some(udid), Some(daemon_devices)) = (udid, REFRESH_DAEMON_DEVICES.get()) {
@@ -302,7 +312,11 @@ impl Impactor {
                     Task::none()
                 }
                 ImpactorScreen::Progress(_) => {
-                    self.navigate_to_screen(ImpactorScreenType::Main);
+                    if let Some(installer) = self.last_installer.clone() {
+                        self.current_screen = ImpactorScreen::Installer(installer);
+                    } else {
+                        self.navigate_to_screen(ImpactorScreenType::Main);
+                    }
                     Task::none()
                 }
                 ImpactorScreen::Settings(_) => {
@@ -444,11 +458,16 @@ impl Impactor {
                     let task = screen.update(msg.clone()).map(Message::MainScreen);
 
                     if let general::Message::NavigateToInstaller(package) = msg {
+                        if let Some(previous) = self.last_installer.take()
+                            && let Some(previous_package) = previous.selected_package
+                        {
+                            previous_package.remove_package_stage();
+                        }
                         let mut options = SignerOptions::default();
                         package.load_into_signer_options(&mut options);
-                        self.current_screen = ImpactorScreen::Installer(
-                            package::PackageScreen::new(Some(package), options),
-                        );
+                        let installer = package::PackageScreen::new(Some(package), options);
+                        self.last_installer = Some(installer.clone());
+                        self.current_screen = ImpactorScreen::Installer(installer);
                     } else if let general::Message::NavigateToUtilities = msg {
                         let rppairing_enabled = match &self.current_screen {
                             ImpactorScreen::Utilities(screen) => screen.rppairing_enabled,
@@ -525,6 +544,45 @@ impl Impactor {
                         settings::Message::ToggleAutoStart(enabled) => {
                             if let Err(err) = crate::startup::set_auto_start_enabled(enabled) {
                                 log::error!("Failed to update auto-start: {err}");
+                            }
+                            Task::none()
+                        }
+                        settings::Message::ToggleDisableWifi(disabled) => {
+                            if let Some(store) = &mut self.account_store {
+                                if let Err(err) = store.set_wifi_devices_disabled_sync(disabled) {
+                                    log::error!("Failed to persist Wi-Fi device preference: {err}");
+                                }
+                            }
+                            self.ensure_selected_device_is_enabled();
+                            Task::none()
+                        }
+                        settings::Message::ToggleDisableLocal(disabled) => {
+                            if let Some(store) = &mut self.account_store {
+                                if let Err(err) = store.set_local_device_disabled_sync(disabled) {
+                                    log::error!("Failed to persist local-device preference: {err}");
+                                }
+                            }
+                            self.ensure_selected_device_is_enabled();
+                            Task::none()
+                        }
+                        settings::Message::ToggleRememberLastIpa(remember) => {
+                            if let Some(store) = &mut self.account_store {
+                                if let Err(err) = store.set_remember_last_ipa_sync(remember) {
+                                    log::error!(
+                                        "Failed to persist IPA retention preference: {err}"
+                                    );
+                                }
+                            }
+                            Task::none()
+                        }
+                        settings::Message::ToggleAutoReturn(enabled) => {
+                            if let Some(store) = &mut self.account_store {
+                                if let Err(err) = store.set_auto_return_after_success_sync(enabled)
+                                {
+                                    log::error!(
+                                        "Failed to persist automatic return preference: {err}"
+                                    );
+                                }
                             }
                             Task::none()
                         }
@@ -627,7 +685,11 @@ impl Impactor {
 
                             self.start_installation_task()
                         }
-                        _ => screen.update(msg).map(Message::InstallerScreen),
+                        _ => {
+                            let task = screen.update(msg).map(Message::InstallerScreen);
+                            self.last_installer = Some(screen.clone());
+                            task
+                        }
                     }
                 } else {
                     Task::none()
@@ -637,7 +699,54 @@ impl Impactor {
                 if let ImpactorScreen::Progress(ref mut screen) = self.current_screen {
                     match msg {
                         progress::Message::Back => Task::done(Message::PreviousScreen),
+                        progress::Message::InstallationProgress(status, -1) => {
+                            let task = screen
+                                .update(progress::Message::InstallationProgress(status, -1))
+                                .map(Message::ProgressScreen);
+                            if !self
+                                .account_store
+                                .as_ref()
+                                .is_some_and(AccountStore::remember_last_ipa)
+                            {
+                                self.last_installer = None;
+                            }
+                            task
+                        }
+                        progress::Message::InstallationError(error) => {
+                            let task = screen
+                                .update(progress::Message::InstallationError(error))
+                                .map(Message::ProgressScreen);
+                            if !self
+                                .account_store
+                                .as_ref()
+                                .is_some_and(AccountStore::remember_last_ipa)
+                            {
+                                self.last_installer = None;
+                            }
+                            task
+                        }
                         progress::Message::InstallationFinished => {
+                            let remember_last_ipa = self
+                                .account_store
+                                .as_ref()
+                                .is_some_and(AccountStore::remember_last_ipa);
+                            let auto_return = self
+                                .account_store
+                                .as_ref()
+                                .is_some_and(AccountStore::auto_return_after_success);
+
+                            if !remember_last_ipa {
+                                self.last_installer = None;
+                            }
+
+                            if auto_return {
+                                if let Some(installer) = self.last_installer.clone() {
+                                    self.current_screen = ImpactorScreen::Installer(installer);
+                                } else {
+                                    self.navigate_to_screen(ImpactorScreenType::Main);
+                                }
+                            }
+
                             Task::done(Message::UpdateTrayMenu)
                         }
                         _ => screen.update(msg).map(Message::ProgressScreen),
@@ -865,12 +974,19 @@ impl Impactor {
     }
 
     fn view_top_bar(&self) -> Element<'_, Message> {
-        let device_names: Vec<String> = self.devices.iter().map(|d| d.to_string()).collect();
-        let selected_device_name = self.selected_device.as_ref().map(|d| d.to_string());
-        let placeholder_str = selected_device_name
+        let device_names: Vec<String> = self
+            .devices
+            .iter()
+            .filter(|device| self.device_is_enabled(device))
+            .map(|device| self.device_display_name(device))
+            .collect();
+        let selected_device_name = self
+            .selected_device
             .as_ref()
-            .map(String::as_str)
-            .unwrap_or("No Device");
+            .map(|device| self.device_display_name(device));
+        let placeholder_str = selected_device_name
+            .clone()
+            .unwrap_or_else(|| t!("no_device").to_string());
 
         let right_button = if matches!(self.current_screen, ImpactorScreen::Settings(_)) {
             button(appearance::icon(appearance::CHEVRON_BACK))
@@ -959,12 +1075,6 @@ impl Impactor {
     fn navigate_to_screen(&mut self, screen_type: ImpactorScreenType) {
         match screen_type {
             ImpactorScreenType::Main => {
-                if let ImpactorScreen::Installer(installer) = &self.current_screen {
-                    if let Some(package) = installer.selected_package.clone() {
-                        package.remove_package_stage();
-                    }
-                }
-
                 self.current_screen = ImpactorScreen::Main(general::GeneralScreen::new());
             }
             ImpactorScreenType::Utilities => {
@@ -990,11 +1100,16 @@ impl Impactor {
 
             let device = self.selected_device.clone();
             let options = installer.options.clone();
+            self.last_installer = Some(installer.clone());
             let account = self
                 .account_store
                 .as_ref()
                 .and_then(|s| s.selected_account().cloned());
             let mut store = self.account_store.clone();
+            let remember_last_ipa = self
+                .account_store
+                .as_ref()
+                .is_some_and(AccountStore::remember_last_ipa);
 
             let (tx, rx) = std::sync::mpsc::channel();
             let progress_rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
@@ -1007,7 +1122,7 @@ impl Impactor {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 let tx_error = tx.clone();
                 rt.block_on(async move {
-                    match subscriptions::run_installation(
+                    let result = subscriptions::run_installation(
                         &package,
                         device.as_ref(),
                         &options,
@@ -1015,22 +1130,19 @@ impl Impactor {
                         store.as_mut(),
                         &tx,
                     )
-                    .await
-                    {
-                        Ok(_) => {
-                            let _ = tx.send(("Installation complete!".to_string(), 100));
+                    .await;
 
-                            if std::env::var("PLUME_DELETE_AFTER_FINISHED").is_err() {
-                                package.remove_package_stage();
-                            }
+                    match result {
+                        Ok(_) => {
+                            let _ = tx.send((t!("progress_finished").to_string(), 100));
                         }
                         Err(e) => {
-                            let _ = tx_error.send((format!("Error: {}", e), -1));
-
-                            if std::env::var("PLUME_DELETE_AFTER_FINISHED").is_err() {
-                                package.remove_package_stage();
-                            }
+                            let _ = tx_error.send((format!("{}: {}", t!("progress_error"), e), -1));
                         }
+                    }
+
+                    if !remember_last_ipa {
+                        package.remove_package_stage();
                     }
                 });
             });
@@ -1038,6 +1150,35 @@ impl Impactor {
             Task::none()
         } else {
             Task::none()
+        }
+    }
+
+    fn device_is_enabled(&self, device: &Device) -> bool {
+        self.account_store.as_ref().is_none_or(|store| {
+            !(store.local_device_disabled() && device.is_mac)
+                && !(store.wifi_devices_disabled() && device.is_wifi())
+        })
+    }
+
+    fn device_display_name(&self, device: &Device) -> String {
+        if device.is_mac {
+            format!("[LOCAL] {}", t!("this_mac"))
+        } else {
+            device.to_string()
+        }
+    }
+
+    fn ensure_selected_device_is_enabled(&mut self) {
+        if self
+            .selected_device
+            .as_ref()
+            .is_some_and(|device| !self.device_is_enabled(device))
+        {
+            self.selected_device = self
+                .devices
+                .iter()
+                .find(|device| self.device_is_enabled(device))
+                .cloned();
         }
     }
 }

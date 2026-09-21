@@ -47,6 +47,12 @@ pub struct Device {
 }
 
 impl Device {
+    pub fn is_wifi(&self) -> bool {
+        self.usbmuxd_device
+            .as_ref()
+            .is_some_and(|device| matches!(&device.connection_type, Connection::Network(_)))
+    }
+
     pub async fn new(usbmuxd_device: UsbmuxdDevice) -> Self {
         let name = Self::get_name_from_usbmuxd_device(&usbmuxd_device)
             .await

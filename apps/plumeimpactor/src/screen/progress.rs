@@ -30,7 +30,7 @@ pub struct ProgressScreen {
 impl ProgressScreen {
     pub fn new() -> Self {
         Self {
-            status: "Idle.".to_string(),
+            status: t!("progress_idle").to_string(),
             progress: 0,
             is_installing: false,
             progress_rx: None,
@@ -40,7 +40,7 @@ impl ProgressScreen {
     pub fn start_installation(&mut self, rx: ProgressReceiver) {
         self.is_installing = true;
         self.progress = 0;
-        self.status = "Idle.".to_string();
+        self.status = t!("progress_idle").to_string();
         self.progress_rx = Some(rx);
     }
 

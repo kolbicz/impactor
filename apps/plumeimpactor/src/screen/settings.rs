@@ -29,6 +29,10 @@ pub enum Message {
     FetchTeams(String),
     TeamsLoaded(String, Vec<Team>),
     ToggleAutoStart(bool),
+    ToggleDisableWifi(bool),
+    ToggleDisableLocal(bool),
+    ToggleRememberLastIpa(bool),
+    ToggleAutoReturn(bool),
     SelectLocale(Option<String>),
 }
 
@@ -89,6 +93,10 @@ impl SettingsScreen {
                 Task::none()
             }
             Message::ToggleAutoStart(_) => Task::none(),
+            Message::ToggleDisableWifi(_) => Task::none(),
+            Message::ToggleDisableLocal(_) => Task::none(),
+            Message::ToggleRememberLastIpa(_) => Task::none(),
+            Message::ToggleAutoReturn(_) => Task::none(),
             Message::SelectTeam(_, _) => Task::none(),
             Message::SelectLocale(_) => Task::none(),
             _ => Task::none(),
@@ -194,6 +202,8 @@ impl SettingsScreen {
 
         let auto_start_enabled = crate::startup::auto_start_enabled();
         content = content.push(self.view_auto_start_toggle(auto_start_enabled));
+        content = content.push(self.view_device_toggles(store));
+        content = content.push(self.view_workflow_toggles(store));
         content = content.push(self.view_language_picker(selected_locale));
         content = content.push(self.view_account_buttons(selected_index));
 
@@ -205,6 +215,34 @@ impl SettingsScreen {
             .label(t!("settings_launch_on_startup"))
             .on_toggle(Message::ToggleAutoStart)
             .into()
+    }
+
+    fn view_device_toggles(&self, store: &AccountStore) -> Element<'_, Message> {
+        column![
+            text(t!("settings_devices")),
+            checkbox(store.wifi_devices_disabled())
+                .label(t!("settings_disable_wifi"))
+                .on_toggle(Message::ToggleDisableWifi),
+            checkbox(store.local_device_disabled())
+                .label(t!("settings_disable_local"))
+                .on_toggle(Message::ToggleDisableLocal),
+        ]
+        .spacing(appearance::THEME_PADDING)
+        .into()
+    }
+
+    fn view_workflow_toggles(&self, store: &AccountStore) -> Element<'_, Message> {
+        column![
+            text(t!("settings_workflow")),
+            checkbox(store.remember_last_ipa())
+                .label(t!("settings_remember_last_ipa"))
+                .on_toggle(Message::ToggleRememberLastIpa),
+            checkbox(store.auto_return_after_success())
+                .label(t!("settings_auto_return"))
+                .on_toggle(Message::ToggleAutoReturn),
+        ]
+        .spacing(appearance::THEME_PADDING)
+        .into()
     }
 
     fn view_language_picker<'a>(

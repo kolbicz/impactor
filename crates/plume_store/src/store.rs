@@ -15,6 +15,14 @@ pub struct AccountStore {
     refreshes: HashMap<String, RefreshDevice>, // UDID -> RefreshDevice (apps?)
     #[serde(default)]
     locale: Option<String>, // None = system locale
+    #[serde(default)]
+    disable_wifi_devices: bool,
+    #[serde(default)]
+    disable_local_device: bool,
+    #[serde(default)]
+    remember_last_ipa: bool,
+    #[serde(default)]
+    auto_return_after_success: bool,
     #[serde(skip)]
     path: Option<PathBuf>,
 }
@@ -146,6 +154,42 @@ impl AccountStore {
 
     pub fn set_locale_sync(&mut self, locale: Option<String>) -> Result<(), Error> {
         self.locale = locale;
+        self.save_sync()
+    }
+
+    pub fn wifi_devices_disabled(&self) -> bool {
+        self.disable_wifi_devices
+    }
+
+    pub fn local_device_disabled(&self) -> bool {
+        self.disable_local_device
+    }
+
+    pub fn set_wifi_devices_disabled_sync(&mut self, disabled: bool) -> Result<(), Error> {
+        self.disable_wifi_devices = disabled;
+        self.save_sync()
+    }
+
+    pub fn set_local_device_disabled_sync(&mut self, disabled: bool) -> Result<(), Error> {
+        self.disable_local_device = disabled;
+        self.save_sync()
+    }
+
+    pub fn remember_last_ipa(&self) -> bool {
+        self.remember_last_ipa
+    }
+
+    pub fn auto_return_after_success(&self) -> bool {
+        self.auto_return_after_success
+    }
+
+    pub fn set_remember_last_ipa_sync(&mut self, remember: bool) -> Result<(), Error> {
+        self.remember_last_ipa = remember;
+        self.save_sync()
+    }
+
+    pub fn set_auto_return_after_success_sync(&mut self, enabled: bool) -> Result<(), Error> {
+        self.auto_return_after_success = enabled;
         self.save_sync()
     }
 

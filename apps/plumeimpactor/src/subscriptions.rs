@@ -1,5 +1,6 @@
 use iced::{Subscription, window};
 use idevice::usbmuxd::{UsbmuxdConnection, UsbmuxdListenEvent};
+use rust_i18n::t;
 use std::sync::Arc;
 use tray_icon::{TrayIconEvent, menu::MenuEvent};
 
@@ -291,7 +292,7 @@ pub(crate) async fn run_installation(
         let _ = tx.send((msg, progress));
     };
 
-    send("Preparing package...".to_string(), 10);
+    send(t!("progress_preparing_package").to_string(), 10);
 
     match options.mode {
         SignerMode::Pem => {
@@ -299,7 +300,7 @@ pub(crate) async fn run_installation(
                 return Err("GSA account is required for PEM signing".to_string());
             };
 
-            send("Ensuring account is valid...".to_string(), 20);
+            send(t!("progress_validating_account").to_string(), 20);
 
             let session = DeveloperSession::new(
                 account.adsid().clone(),
@@ -346,7 +347,7 @@ pub(crate) async fn run_installation(
             .await
             .map_err(|e| e.to_string())?;
 
-            send("Ensuring device is registered...".to_string(), 30);
+            send(t!("progress_registering_device").to_string(), 30);
 
             if let Some(dev) = &device {
                 session
@@ -355,13 +356,13 @@ pub(crate) async fn run_installation(
                     .map_err(|e| e.to_string())?;
             }
 
-            send("Extracting package...".to_string(), 50);
+            send(t!("progress_extracting_package").to_string(), 50);
 
             let mut signer = Signer::new(Some(identity), options.clone());
 
             let bundle = package.get_package_bundle().map_err(|e| e.to_string())?;
 
-            send("Signing package...".to_string(), 70);
+            send(t!("progress_signing_package").to_string(), 70);
 
             signer
                 .modify_bundle(&bundle, &Some(team_id.clone()))
@@ -380,13 +381,13 @@ pub(crate) async fn run_installation(
             package_file = bundle;
         }
         SignerMode::Adhoc => {
-            send("Extracting package...".to_string(), 50);
+            send(t!("progress_extracting_package").to_string(), 50);
 
             let mut signer = Signer::new(None, options.clone());
 
             let bundle = package.get_package_bundle().map_err(|e| e.to_string())?;
 
-            send("Signing package...".to_string(), 70);
+            send(t!("progress_signing_package").to_string(), 70);
 
             signer
                 .modify_bundle(&bundle, &None)
@@ -401,7 +402,7 @@ pub(crate) async fn run_installation(
             package_file = bundle;
         }
         _ => {
-            send("Extracting package...".to_string(), 50);
+            send(t!("progress_extracting_package").to_string(), 50);
 
             let bundle = package.get_package_bundle().map_err(|e| e.to_string())?;
 
@@ -413,15 +414,17 @@ pub(crate) async fn run_installation(
         SignerInstallMode::Install => {
             if let Some(dev) = &device {
                 if !dev.is_mac {
-                    send("Sending to device...".to_string(), 70);
+                    send(t!("progress_sending_to_device").to_string(), 70);
 
                     let tx_clone = tx.clone();
+                    let installing = t!("progress_installing").to_string();
                     dev.install_app(&package_file.bundle_dir(), move |progress: i32| {
                         let tx = tx_clone.clone();
+                        let installing = installing.clone();
                         // Some libraries expect this future to be processed.
                         // We ensure it sends and resolves immediately.
                         Box::pin(async move {
-                            let _ = tx.send(("Installing...".to_string(), 70 + (progress / 5)));
+                            let _ = tx.send((installing, 70 + (progress / 5)));
                         })
                     })
                     .await
@@ -441,7 +444,7 @@ pub(crate) async fn run_installation(
                         }
                     }
                 } else {
-                    send("Installing...".to_string(), 90);
+                    send(t!("progress_installing").to_string(), 90);
 
                     plume_utils::install_app_mac(&package_file.bundle_dir())
                         .await
@@ -452,14 +455,14 @@ pub(crate) async fn run_installation(
             }
         }
         SignerInstallMode::Export => {
-            send("Exporting...".to_string(), 90);
+            send(t!("progress_exporting").to_string(), 90);
 
             let archive_path = package
                 .get_archive_based_on_path(&package_file.bundle_dir())
                 .map_err(|e| e.to_string())?;
 
             let file = rfd::AsyncFileDialog::new()
-                .set_title("Save Package As")
+                .set_title(t!("save_package_as"))
                 .set_file_name(
                     archive_path
                         .file_name()
@@ -478,7 +481,7 @@ pub(crate) async fn run_installation(
     }
 
     if options.refresh && options.mode == SignerMode::Pem {
-        send("Saving for refresh...".to_string(), 75);
+        send(t!("progress_saving_for_refresh").to_string(), 75);
         let path = get_data_path().join("refresh_store");
         tokio::fs::create_dir_all(&path)
             .await
@@ -558,7 +561,7 @@ pub(crate) async fn run_installation(
         }
     }
 
-    send("Finished!".to_string(), 100);
+    send(t!("progress_finished").to_string(), 100);
 
     Ok(())
 }
