@@ -11,6 +11,7 @@ use crate::appearance;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    PackageDropped(PathBuf),
     UpdateCustomName(String),
     UpdateCustomIdentifier(String),
     UpdateCustomVersion(String),
@@ -88,6 +89,35 @@ impl PackageScreen {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::PackageDropped(path) => {
+                let is_package = path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        extension.eq_ignore_ascii_case("ipa")
+                            || extension.eq_ignore_ascii_case("tipa")
+                    });
+
+                if !is_package {
+                    return Task::none();
+                }
+
+                if let Ok(package) = Package::new(path) {
+                    let mut package_defaults = SignerOptions::default();
+                    package.load_into_signer_options(&mut package_defaults);
+                    self.options.app = package_defaults.app;
+                    self.package_icon_handle = package
+                        .app_icon_data
+                        .as_ref()
+                        .and_then(|data| icon_handle_from_bytes(data));
+
+                    if let Some(previous_package) = self.selected_package.replace(package) {
+                        previous_package.remove_package_stage();
+                    }
+                }
+
+                Task::none()
+            }
             Message::UpdateCustomName(name) => {
                 let pkg_name = self
                     .selected_package

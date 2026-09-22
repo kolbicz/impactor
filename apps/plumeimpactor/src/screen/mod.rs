@@ -1,5 +1,5 @@
 pub(crate) mod general;
-mod package;
+pub(crate) mod package;
 mod progress;
 pub(crate) mod settings;
 mod utilties;
@@ -894,10 +894,10 @@ impl Impactor {
 
         let tray_subscription = subscriptions::tray_subscription();
 
-        let hover_subscription = if let ImpactorScreen::Main(_) = self.current_screen {
-            subscriptions::file_hover_subscription()
-        } else {
-            Subscription::none()
+        let hover_subscription = match self.current_screen {
+            ImpactorScreen::Main(_) => subscriptions::file_hover_subscription(false),
+            ImpactorScreen::Installer(_) => subscriptions::file_hover_subscription(true),
+            _ => Subscription::none(),
         };
 
         let progress_subscription =

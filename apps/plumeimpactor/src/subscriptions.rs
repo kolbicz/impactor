@@ -6,7 +6,7 @@ use tray_icon::{TrayIconEvent, menu::MenuEvent};
 
 use crate::{
     defaults::get_data_path,
-    screen::{Message, general},
+    screen::{Message, general, package},
 };
 use plume_utils::{Bundle, Device, PlistInfoTrait};
 
@@ -202,12 +202,17 @@ pub(crate) fn relaunch_subscription() -> Subscription<Message> {
     Subscription::none()
 }
 
-pub(crate) fn file_hover_subscription() -> Subscription<Message> {
-    let window_events = window::events().filter_map(|(_id, event)| match event {
-        window::Event::FileHovered(_) => Some(Message::MainScreen(general::Message::FilesHovered)),
-        window::Event::FilesHoveredLeft => {
+pub(crate) fn file_hover_subscription(installer_screen: bool) -> Subscription<Message> {
+    let window_events = window::events().filter_map(move |(_id, event)| match event {
+        window::Event::FileHovered(_) if !installer_screen => {
+            Some(Message::MainScreen(general::Message::FilesHovered))
+        }
+        window::Event::FilesHoveredLeft if !installer_screen => {
             Some(Message::MainScreen(general::Message::FilesHoveredLeft))
         }
+        window::Event::FileDropped(path) if installer_screen => Some(Message::InstallerScreen(
+            package::Message::PackageDropped(path),
+        )),
         window::Event::FileDropped(path) => {
             Some(Message::MainScreen(general::Message::FilesDropped(vec![
                 path,
