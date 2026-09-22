@@ -68,6 +68,24 @@ impl PackageScreen {
         }
     }
 
+    pub fn reload_selected_package(&mut self) -> Result<Option<Package>, plume_utils::Error> {
+        let Some(package) = self.selected_package.as_ref() else {
+            return Ok(None);
+        };
+
+        let refreshed_package = package.reload_from_source()?;
+        self.package_icon_handle = refreshed_package
+            .app_icon_data
+            .as_ref()
+            .and_then(|data| icon_handle_from_bytes(data));
+
+        if let Some(previous_package) = self.selected_package.replace(refreshed_package.clone()) {
+            previous_package.remove_package_stage();
+        }
+
+        Ok(Some(refreshed_package))
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::UpdateCustomName(name) => {

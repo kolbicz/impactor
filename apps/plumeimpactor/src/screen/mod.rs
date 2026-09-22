@@ -1093,9 +1093,22 @@ impl Impactor {
     }
 
     fn start_installation_task(&mut self) -> Task<Message> {
-        if let ImpactorScreen::Installer(installer) = &self.current_screen {
-            let Some(package) = installer.selected_package.clone() else {
-                return Task::none();
+        if let ImpactorScreen::Installer(installer) = &mut self.current_screen {
+            let package = match installer.reload_selected_package() {
+                Ok(Some(package)) => package,
+                Ok(None) => return Task::none(),
+                Err(error) => {
+                    let mut progress_screen = progress::ProgressScreen::new();
+                    let task = progress_screen
+                        .update(progress::Message::InstallationError(format!(
+                            "{}: {}",
+                            t!("progress_error"),
+                            error
+                        )))
+                        .map(Message::ProgressScreen);
+                    self.current_screen = ImpactorScreen::Progress(progress_screen);
+                    return task;
+                }
             };
 
             let device = self.selected_device.clone();

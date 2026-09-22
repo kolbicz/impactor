@@ -9,6 +9,7 @@ use zip::write::FileOptions;
 
 #[derive(Debug, Clone)]
 pub struct Package {
+    source_package_file: PathBuf,
     package_file: PathBuf,
     stage_dir: PathBuf,
     stage_payload_dir: PathBuf,
@@ -44,6 +45,7 @@ impl Package {
         );
 
         Ok(Self {
+            source_package_file: package_file,
             package_file: out_package_file,
             stage_dir: stage_dir.clone(),
             stage_payload_dir: stage_dir.join("Payload"),
@@ -55,6 +57,10 @@ impl Package {
 
     pub fn package_file(&self) -> &PathBuf {
         &self.package_file
+    }
+
+    pub fn reload_from_source(&self) -> Result<Self, Error> {
+        Self::new(self.source_package_file.clone())
     }
 
     fn get_info_plist_from_archive(
