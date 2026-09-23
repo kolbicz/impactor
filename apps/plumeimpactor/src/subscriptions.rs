@@ -203,25 +203,29 @@ pub(crate) fn relaunch_subscription() -> Subscription<Message> {
 }
 
 pub(crate) fn file_hover_subscription(installer_screen: bool) -> Subscription<Message> {
-    let window_events = window::events().filter_map(move |(_id, event)| match event {
-        window::Event::FileHovered(_) if !installer_screen => {
-            Some(Message::MainScreen(general::Message::FilesHovered))
-        }
-        window::Event::FilesHoveredLeft if !installer_screen => {
-            Some(Message::MainScreen(general::Message::FilesHoveredLeft))
-        }
-        window::Event::FileDropped(path) if installer_screen => Some(Message::InstallerScreen(
-            package::Message::PackageDropped(path),
-        )),
-        window::Event::FileDropped(path) => {
-            Some(Message::MainScreen(general::Message::FilesDropped(vec![
-                path,
-            ])))
-        }
-        _ => None,
-    });
-
-    window_events
+    if installer_screen {
+        window::events().filter_map(|(_id, event)| match event {
+            window::Event::FileDropped(path) => Some(Message::InstallerScreen(
+                package::Message::PackageDropped(path),
+            )),
+            _ => None,
+        })
+    } else {
+        window::events().filter_map(|(_id, event)| match event {
+            window::Event::FileHovered(_) => {
+                Some(Message::MainScreen(general::Message::FilesHovered))
+            }
+            window::Event::FilesHoveredLeft => {
+                Some(Message::MainScreen(general::Message::FilesHoveredLeft))
+            }
+            window::Event::FileDropped(path) => {
+                Some(Message::MainScreen(general::Message::FilesDropped(vec![
+                    path,
+                ])))
+            }
+            _ => None,
+        })
+    }
 }
 
 pub(crate) fn installation_progress_listener(
