@@ -261,7 +261,7 @@ impl AnisetteClient {
                 if message.contains("-45061") {
                     Err(AnisetteError::AnisetteNotProvisioned)
                 } else {
-                    panic!("Unknown error {}", message)
+                    Err(AnisetteError::ServerError(message))
                 }
             }
             AnisetteHeaders::Headers {
@@ -507,7 +507,7 @@ impl AnisetteHeadersProvider for RemoteAnisetteProviderV3 {
                     plist::to_file_xml(config_path, state)?;
                     client.get_headers(&state).await?
                 } else {
-                    panic!()
+                    return Err(err);
                 }
             }
         };
