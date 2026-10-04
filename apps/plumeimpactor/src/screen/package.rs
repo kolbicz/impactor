@@ -298,7 +298,7 @@ impl PackageScreen {
             Message::SetCustomEntitlements => Task::perform(
                 async {
                     rfd::AsyncFileDialog::new()
-                        .add_filter("Entitlements plist", &["plist", "xml"])
+                        .add_filter("Entitlements plist", &["plist", "xml", "entitlements"])
                         .set_title("Select Entitlements File")
                         .pick_file()
                         .await

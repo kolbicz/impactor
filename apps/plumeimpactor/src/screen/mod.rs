@@ -948,13 +948,16 @@ impl Impactor {
         });
 
         let keyboard_focus_subscription =
-            iced::event::listen_with(|event, _status, window_id| match event {
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
-                    modifiers,
-                    repeat: false,
-                    ..
-                }) if !modifiers.intersects(
+            iced::event::listen_with(|event, status, window_id| match (event, status) {
+                (
+                    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+                        modifiers,
+                        repeat: false,
+                        ..
+                    }),
+                    iced::event::Status::Ignored,
+                ) if !modifiers.intersects(
                     iced::keyboard::Modifiers::CTRL
                         | iced::keyboard::Modifiers::ALT
                         | iced::keyboard::Modifiers::LOGO,
