@@ -8,7 +8,7 @@ mod windows;
 use std::collections::VecDeque;
 
 use iced::Length::Fill;
-use iced::widget::{button, column, container, pick_list, row, stack, text};
+use iced::widget::{button, column, container, operation, pick_list, row, stack, text};
 use iced::window;
 use iced::{Element, Subscription, Task};
 
@@ -68,6 +68,10 @@ pub enum Message {
 
     // Login window
     LoginWindowMessage(window::Id, login_window::Message),
+    MoveKeyboardFocus {
+        window_id: window::Id,
+        backwards: bool,
+    },
 
     // Screen-specific messages
     MainScreen(general::Message),
@@ -449,6 +453,24 @@ impl Impactor {
                     }
 
                     task.map(move |msg| Message::LoginWindowMessage(id, msg))
+                } else {
+                    Task::none()
+                }
+            }
+            Message::MoveKeyboardFocus {
+                window_id,
+                backwards,
+            } => {
+                if let Some(login_window) = self.login_windows.get(&window_id) {
+                    login_window
+                        .move_keyboard_focus(backwards)
+                        .map(move |message| Message::LoginWindowMessage(window_id, message))
+                } else if self.main_window == Some(window_id) {
+                    if backwards {
+                        operation::focus_previous()
+                    } else {
+                        operation::focus_next()
+                    }
                 } else {
                     Task::none()
                 }
@@ -925,6 +947,27 @@ impl Impactor {
             None
         });
 
+        let keyboard_focus_subscription =
+            iced::event::listen_with(|event, _status, window_id| match event {
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+                    modifiers,
+                    repeat: false,
+                    ..
+                }) if !modifiers.intersects(
+                    iced::keyboard::Modifiers::CTRL
+                        | iced::keyboard::Modifiers::ALT
+                        | iced::keyboard::Modifiers::LOGO,
+                ) =>
+                {
+                    Some(Message::MoveKeyboardFocus {
+                        window_id,
+                        backwards: modifiers.shift(),
+                    })
+                }
+                _ => None,
+            });
+
         Subscription::batch(vec![
             device_subscription,
             tray_subscription,
@@ -934,6 +977,7 @@ impl Impactor {
             certificate_reset_subscription,
             relaunch_subscription,
             close_subscription,
+            keyboard_focus_subscription,
         ])
     }
 

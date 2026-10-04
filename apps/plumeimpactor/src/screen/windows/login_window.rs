@@ -1,5 +1,5 @@
 use iced::futures::SinkExt;
-use iced::widget::{button, column, container, row, text, text_input};
+use iced::widget::{Id, button, column, container, operation, row, text, text_input};
 use iced::{Alignment, Element, Fill, Task, window};
 use plume_core::auth::{TwoFactorAction, TwoFactorMethod, TwoFactorRequest};
 use plume_core::{AnisetteConfiguration, auth::Account};
@@ -25,6 +25,14 @@ pub enum Message {
         sms: bool,
         phones: Vec<(u32, String)>,
     },
+    EmailFocusChecked {
+        backwards: bool,
+        focused: bool,
+    },
+    PasswordFocusChecked {
+        backwards: bool,
+        focused: bool,
+    },
 }
 
 pub struct LoginWindow {
@@ -39,6 +47,9 @@ pub struct LoginWindow {
     two_factor_is_sms: bool,
     trusted_phones: Vec<(u32, String)>,
     two_factor_tx: Option<std_mpsc::Sender<Result<TwoFactorAction, String>>>,
+    email_input_id: Id,
+    password_input_id: Id,
+    two_factor_input_id: Id,
 }
 
 impl LoginWindow {
@@ -64,6 +75,9 @@ impl LoginWindow {
                 two_factor_is_sms: false,
                 trusted_phones: Vec::new(),
                 two_factor_tx: None,
+                email_input_id: Id::unique(),
+                password_input_id: Id::unique(),
+                two_factor_input_id: Id::unique(),
             },
             task.discard(),
         )
@@ -110,7 +124,7 @@ impl LoginWindow {
                 self.two_factor_code.clear();
                 self.login_error = None;
                 self.two_factor_error = None;
-                Task::none()
+                operation::focus(self.two_factor_input_id.clone())
             }
             Message::LoginCancel => {
                 if let Some(id) = self.window_id {
@@ -187,6 +201,31 @@ impl LoginWindow {
                     Task::none()
                 }
             }
+            Message::EmailFocusChecked { backwards, focused } => {
+                if focused {
+                    operation::focus(self.password_input_id.clone())
+                } else {
+                    operation::is_focused(self.password_input_id.clone())
+                        .map(move |focused| Message::PasswordFocusChecked { backwards, focused })
+                }
+            }
+            Message::PasswordFocusChecked { backwards, focused } => {
+                let target = if focused || !backwards {
+                    self.email_input_id.clone()
+                } else {
+                    self.password_input_id.clone()
+                };
+                operation::focus(target)
+            }
+        }
+    }
+
+    pub fn move_keyboard_focus(&self, backwards: bool) -> Task<Message> {
+        if self.show_two_factor {
+            operation::focus(self.two_factor_input_id.clone())
+        } else {
+            operation::is_focused(self.email_input_id.clone())
+                .map(move |focused| Message::EmailFocusChecked { backwards, focused })
         }
     }
 
@@ -200,11 +239,13 @@ impl LoginWindow {
 
     fn view_login(&self) -> Element<'_, Message> {
         let email_input = text_input("claration@riseup.net", &self.email)
+            .id(self.email_input_id.clone())
             .on_input(Message::EmailChanged)
             .padding(8)
             .width(Fill);
 
         let mut password_input = text_input("password", &self.password)
+            .id(self.password_input_id.clone())
             .on_input(Message::PasswordChanged)
             .secure(true)
             .padding(8)
@@ -256,6 +297,7 @@ impl LoginWindow {
 
     fn view_two_factor(&self) -> Element<'_, Message> {
         let mut code_input = text_input("Verification Code", &self.two_factor_code)
+            .id(self.two_factor_input_id.clone())
             .on_input(Message::TwoFactorCodeChanged)
             .padding(8)
             .width(Fill);
