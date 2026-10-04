@@ -6,6 +6,7 @@ use plume_utils::discovery::{
     DeviceDiscovery, DeviceType, DiscoveredDevice, PlatformDiscovery,
     REMOTEPAIRING_MANUAL_PAIRING_SERVICE, REMOTEPAIRING_SERVICE,
 };
+use rust_i18n::t;
 use std::time::Duration;
 
 use crate::appearance;
@@ -116,8 +117,7 @@ impl TvOsPairingScreen {
     fn manual_pairing_entry(&self) -> Option<&DiscoveredDevice> {
         let label = self.selected_label()?;
         self.discovered.iter().find(|d| {
-            Self::device_label(d) == label
-                && d.service_type == REMOTEPAIRING_MANUAL_PAIRING_SERVICE
+            Self::device_label(d) == label && d.service_type == REMOTEPAIRING_MANUAL_PAIRING_SERVICE
         })
     }
 
@@ -140,7 +140,7 @@ impl TvOsPairingScreen {
         match message {
             Message::Scan => {
                 self.scanning = true;
-                self.status = Some(StatusMessage::info("Scanning for Apple TVs..."));
+                self.status = Some(StatusMessage::info(t!("tvos_scanning")));
                 self.discovered.clear();
                 self.selected_label = None;
                 self.pin.clear();
@@ -184,13 +184,10 @@ impl TvOsPairingScreen {
                             .collect::<std::collections::HashSet<_>>()
                             .len();
                         if tv_count == 0 {
-                            self.status =
-                                Some(StatusMessage::info("No Apple TVs found on this network."));
+                            self.status = Some(StatusMessage::info(t!("tvos_none_found")));
                         } else {
-                            self.status = Some(StatusMessage::info(format!(
-                                "Found {} Apple TV(s). Select one to pair.",
-                                tv_count
-                            )));
+                            self.status =
+                                Some(StatusMessage::info(t!("tvos_found", count = tv_count)));
                         }
                     }
                     Err(e) => {
@@ -249,7 +246,7 @@ impl TvOsPairingScreen {
                 self.pin.clear();
                 self.awaiting_pin = false;
                 self.pairing = true;
-                self.status = Some(StatusMessage::info("Connecting to Apple TV..."));
+                self.status = Some(StatusMessage::info(t!("tvos_connecting")));
 
                 let (pin_req_tx, mut pin_req_rx) = iced::futures::channel::mpsc::unbounded::<()>();
                 let (result_tx, mut result_rx) =
@@ -328,9 +325,7 @@ impl TvOsPairingScreen {
                     return Task::none();
                 };
                 let Some(ip_str) = dev.ip_address.clone() else {
-                    self.status = Some(StatusMessage::error(
-                        "Selected device has no IP address.",
-                    ));
+                    self.status = Some(StatusMessage::error("Selected device has no IP address."));
                     return Task::none();
                 };
                 let Some(reconnect_port) = dev.port else {
@@ -341,7 +336,7 @@ impl TvOsPairingScreen {
                 let identity = Self::pairing_identity(dev);
                 let cache_dir = get_data_path();
                 self.reconnecting = true;
-                self.status = Some(StatusMessage::info("Reconnecting to Apple TV..."));
+                self.status = Some(StatusMessage::info(t!("tvos_reconnecting")));
 
                 let (tx, rx) = std::sync::mpsc::sync_channel(1);
                 std::thread::spawn(move || {
@@ -397,8 +392,7 @@ impl TvOsPairingScreen {
             Message::PinRequested(requested) => {
                 if requested {
                     self.awaiting_pin = true;
-                    self.status =
-                        Some(StatusMessage::info("Enter the code shown on your Apple TV"));
+                    self.status = Some(StatusMessage::info(t!("tvos_enter_code_short")));
                 }
                 Task::none()
             }
@@ -411,7 +405,7 @@ impl TvOsPairingScreen {
                     let _ = tx.try_send(self.pin.clone());
                 }
                 self.awaiting_pin = false;
-                self.status = Some(StatusMessage::info("Verifying..."));
+                self.status = Some(StatusMessage::info(t!("tvos_verifying")));
                 Task::none()
             }
 
@@ -420,7 +414,7 @@ impl TvOsPairingScreen {
                     let _ = tx.try_send(String::new());
                 }
                 self.awaiting_pin = false;
-                self.status = Some(StatusMessage::info("Cancelling pairing..."));
+                self.status = Some(StatusMessage::info(t!("tvos_cancelling")));
                 Task::none()
             }
 
@@ -431,7 +425,7 @@ impl TvOsPairingScreen {
                 match result {
                     Ok(device) => {
                         self.paired_device = Some(device);
-                        self.status = Some(StatusMessage::success("Paired successfully."));
+                        self.status = Some(StatusMessage::success(t!("tvos_paired_success")));
                         self.pin.clear();
                     }
                     Err(e) => {
@@ -446,7 +440,7 @@ impl TvOsPairingScreen {
                 match result {
                     Ok(device) => {
                         self.paired_device = Some(device);
-                        self.status = Some(StatusMessage::success("Reconnected successfully."));
+                        self.status = Some(StatusMessage::success(t!("tvos_reconnected_success")));
                     }
                     Err(error) => self.status = Some(StatusMessage::error(error)),
                 }
@@ -481,7 +475,7 @@ impl TvOsPairingScreen {
                         .map_err(|e| format!("{e}"));
                     let _ = tx.send(result);
                 });
-                self.status = Some(StatusMessage::info("Removing Apple TV pairing..."));
+                self.status = Some(StatusMessage::info(t!("tvos_removing_pairing")));
                 Task::perform(
                     async move {
                         std::thread::spawn(move || {
@@ -499,9 +493,7 @@ impl TvOsPairingScreen {
                 match result {
                     Ok(_) => {
                         self.paired_device = None;
-                        self.status = Some(StatusMessage::success(
-                            "Host pairing removed. The Apple TV may reconnect without a PIN until its remote devices are forgotten.",
-                        ));
+                        self.status = Some(StatusMessage::success(t!("tvos_pairing_removed")));
                     }
                     Err(error) => self.status = Some(StatusMessage::error(error)),
                 }
@@ -535,9 +527,9 @@ impl TvOsPairingScreen {
         let mut content = column![];
 
         let scan_label = if self.scanning {
-            "Scanning..."
+            t!("tvos_scanning")
         } else {
-            "Scan for Apple TVs"
+            t!("tvos_scan")
         };
         content = content.push(
             button(text(scan_label).align_x(Center))
@@ -573,13 +565,17 @@ impl TvOsPairingScreen {
                     self.selected_label.clone(),
                     Message::SelectDevice,
                 )
-                .placeholder("Select an Apple TV")
+                .placeholder(t!("tvos_select"))
                 .width(Fill),
             );
         }
 
         if self.selected_label.is_some() && !self.awaiting_pin {
-            let pair_label = if self.pairing { "Pairing..." } else { "Pair" };
+            let pair_label = if self.pairing {
+                t!("tvos_pairing")
+            } else {
+                t!("tvos_pair")
+            };
             if self.manual_pairing_entry().is_some() {
                 content = content.push(
                     button(text(pair_label).align_x(Center))
@@ -594,9 +590,9 @@ impl TvOsPairingScreen {
             }
             if self.reconnect_entry().is_some() {
                 let reconnect_label = if self.reconnecting {
-                    "Reconnecting..."
+                    t!("tvos_reconnecting")
                 } else {
-                    "Reconnect"
+                    t!("tvos_reconnect")
                 };
                 content = content.push(
                     button(text(reconnect_label).align_x(Center))
@@ -614,7 +610,7 @@ impl TvOsPairingScreen {
         if self.awaiting_pin {
             content = content
                 .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
-            content = content.push(text("Enter the 6-digit code shown on your Apple TV:").size(13));
+            content = content.push(text(t!("tvos_enter_code")).size(13));
             content = content.push(
                 row![
                     text_input("123456", &self.pin)
@@ -625,7 +621,7 @@ impl TvOsPairingScreen {
                             None
                         })
                         .width(iced::Length::Fixed(120.0)),
-                    button(text("Submit").align_x(Center))
+                    button(text(t!("tvos_submit")).align_x(Center))
                         .on_press_maybe(if self.pin.len() == 6 {
                             Some(Message::SubmitPin)
                         } else {
@@ -637,7 +633,7 @@ impl TvOsPairingScreen {
                 .align_y(Center),
             );
             content = content.push(
-                button(text("Cancel").align_x(Center))
+                button(text(t!("tvos_cancel")).align_x(Center))
                     .on_press(Message::CancelPin)
                     .style(appearance::s_button)
                     .width(Fill),
@@ -650,8 +646,10 @@ impl TvOsPairingScreen {
     fn view_paired(&self, device: &Device) -> iced::widget::Column<'_, Message> {
         let mut content = column![];
 
-        content = content
-            .push(text(format!("Paired with {}", device.name)).size(appearance::THEME_FONT_SIZE + 2.0));
+        content = content.push(
+            text(t!("tvos_paired_with", name = device.name.clone()))
+                .size(appearance::THEME_FONT_SIZE + 2.0),
+        );
 
         content = content.push(
             text(format!(
@@ -663,15 +661,7 @@ impl TvOsPairingScreen {
             .size(13),
         );
 
-        content = content.push(
-            text(
-                "This Apple TV is now selectable in the device list at the top of the window. \
-                 To install to it, import an IPA from the main screen the same way you would \
-                 for any other device. Forgetting here removes Impactor's local pairing record; \
-                 use the Apple TV's Forget All Remote Devices option to require a new PIN.",
-            )
-            .size(13),
-        );
+        content = content.push(text(t!("tvos_paired_help")).size(13));
 
         if let Some(ref s) = self.status {
             content = content.push(text(&s.content).size(13).color(s.color()));
@@ -680,13 +670,13 @@ impl TvOsPairingScreen {
         content =
             content.push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
         content = content.push(
-            button(text("Pair a Different Apple TV").align_x(Center))
+            button(text(t!("tvos_pair_different")).align_x(Center))
                 .on_press(Message::StartOver)
                 .style(appearance::s_button)
                 .width(Fill),
         );
         content = content.push(
-            button(text("Forget Host Pairing").align_x(Center))
+            button(text(t!("tvos_forget_pairing")).align_x(Center))
                 .on_press(Message::Forget)
                 .style(appearance::s_button)
                 .width(Fill),

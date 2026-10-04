@@ -790,9 +790,11 @@ impl Impactor {
                 if let ImpactorScreen::Progress(ref mut screen) = self.current_screen {
                     match msg {
                         progress::Message::Back => Task::done(Message::PreviousScreen),
-                        progress::Message::InstallationProgress(status, -1) => {
+                        progress::Message::InstallationProgress(update)
+                            if update.progress == -1 =>
+                        {
                             let task = screen
-                                .update(progress::Message::InstallationProgress(status, -1))
+                                .update(progress::Message::InstallationProgress(update))
                                 .map(Message::ProgressScreen);
                             if !self
                                 .account_store
@@ -1109,9 +1111,7 @@ impl Impactor {
                 screen.view(has_device).map(Message::InstallerScreen)
             }
             ImpactorScreen::Progress(screen) => screen.view().map(Message::ProgressScreen),
-            ImpactorScreen::TvOsPairing(screen) => {
-                screen.view().map(Message::TvOsPairingScreen)
-            }
+            ImpactorScreen::TvOsPairing(screen) => screen.view().map(Message::TvOsPairingScreen),
         }
     }
 
@@ -1235,8 +1235,7 @@ impl Impactor {
                 self.current_screen =
                     ImpactorScreen::TvOsPairing(tvos_pairing::TvOsPairingScreen::new());
             }
-            ImpactorScreenType::Installer => {
-            }
+            ImpactorScreenType::Installer => {}
         }
     }
 

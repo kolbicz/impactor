@@ -170,12 +170,14 @@ pub(crate) fn network_device_listener() -> Subscription<Message> {
                                         }
                                     }
 
-                                    for id in plume_utils::discovery::disconnected_after_missed_scans(
-                                        &mut present_ids,
-                                        &current_ids,
-                                        &mut miss_counts,
-                                        2,
-                                    ) {
+                                    for id in
+                                        plume_utils::discovery::disconnected_after_missed_scans(
+                                            &mut present_ids,
+                                            &current_ids,
+                                            &mut miss_counts,
+                                            2,
+                                        )
+                                    {
                                         let _ = tx.unbounded_send(Message::DeviceDisconnected(id));
                                         last_emitted.remove(&id);
                                     }
@@ -496,7 +498,7 @@ pub(crate) async fn run_installation(
 
             send(t!("progress_registering_device").to_string(), 30);
 
-            if let Some(dev) = device.filter(|dev| !dev.is_mac) {
+            if let Some(dev) = device {
                 session
                     .qh_ensure_device(team_id, &dev.name, &dev.udid, platform)
                     .await
@@ -526,12 +528,12 @@ pub(crate) async fn run_installation(
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-            send("Signing package...".to_string(), 70);
+            send(t!("progress_signing_package").to_string(), 70);
             signer
                 .sign_bundle_for_device(&bundle, platform, device_udid)
                 .await
                 .map_err(|e| e.to_string())?;
-            send("Verifying signatures and provisioning profiles...".to_string(), 82);
+            send(t!("progress_verifying_package").to_string(), 82);
             signer
                 .validate_signed_bundle(&bundle, platform, device_udid)
                 .map_err(|e| e.to_string())?;
@@ -578,7 +580,7 @@ pub(crate) async fn run_installation(
                 if !dev.is_mac {
                     let upload_path = if dev.is_network() {
                         let _ = tx.send(ProgressUpdate::indeterminate(
-                            "Packaging for transfer...".to_string(),
+                            t!("progress_packaging_transfer").to_string(),
                             70,
                         ));
 
@@ -604,17 +606,18 @@ pub(crate) async fn run_installation(
 
                     if dev.is_network() {
                         let _ = tx.send(ProgressUpdate::indeterminate(
-                            "Pairing/reconnecting to Apple TV...".to_string(),
+                            t!("progress_pairing_apple_tv").to_string(),
                             72,
                         ));
                     }
 
                     let upload_status = match tokio::fs::metadata(&upload_path).await {
-                        Ok(meta) if meta.is_file() => format!(
-                            "Sending to device ({})...",
-                            plume_utils::format_bytes(meta.len())
-                        ),
-                        _ => "Sending to device...".to_string(),
+                        Ok(meta) if meta.is_file() => t!(
+                            "progress_sending_to_device_size",
+                            size = plume_utils::format_bytes(meta.len())
+                        )
+                        .to_string(),
+                        _ => t!("progress_sending_to_device").to_string(),
                     };
                     let _ = tx.send(ProgressUpdate::indeterminate(upload_status, 70));
 
@@ -662,11 +665,8 @@ pub(crate) async fn run_installation(
             let archive_path = package
                 .get_archive_based_on_path(&package_file.bundle_dir())
                 .map_err(|e| e.to_string())?;
-            plume_utils::Package::validate_archive(
-                &archive_path,
-                options.mode == SignerMode::Pem,
-            )
-            .map_err(|e| e.to_string())?;
+            plume_utils::Package::validate_archive(&archive_path, options.mode == SignerMode::Pem)
+                .map_err(|e| e.to_string())?;
 
             let file = rfd::AsyncFileDialog::new()
                 .set_title(t!("save_package_as"))

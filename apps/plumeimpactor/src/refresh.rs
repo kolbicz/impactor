@@ -273,12 +273,10 @@ impl RefreshDaemon {
         };
 
         let team_id_string = team_id.to_string();
-        if !device.is_mac {
-            session
-                .qh_ensure_device(&team_id_string, &device.name, &device.udid, platform)
-                .await
-                .map_err(|e| format!("Failed to ensure device: {}", e))?;
-        }
+        session
+            .qh_ensure_device(&team_id_string, &device.name, &device.udid, platform)
+            .await
+            .map_err(|e| format!("Failed to ensure device: {}", e))?;
 
         let bundle =
             Bundle::new(app.path.clone()).map_err(|e| format!("Failed to create bundle: {}", e))?;

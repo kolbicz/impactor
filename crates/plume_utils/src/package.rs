@@ -1,7 +1,7 @@
 use super::{Bundle, PlistInfoTrait};
 use crate::{Error, SignerApp, SignerOptions, cgbi};
-use plume_core::MobileProvision;
 use plist::Dictionary;
+use plume_core::MobileProvision;
 use std::path::{Path, PathBuf};
 use std::{env, fs, io::Read};
 use uuid::Uuid;
@@ -190,7 +190,12 @@ impl Package {
     pub fn validate_archive(path: &Path, require_profile: bool) -> Result<(), Error> {
         let mut archive = ZipArchive::new(fs::File::open(path)?)?;
         let app_prefix = (0..archive.len())
-            .filter_map(|index| archive.by_index(index).ok().map(|entry| entry.name().to_string()))
+            .filter_map(|index| {
+                archive
+                    .by_index(index)
+                    .ok()
+                    .map(|entry| entry.name().to_string())
+            })
             .find(|entry| {
                 entry.starts_with("Payload/")
                     && entry.ends_with("/Info.plist")
@@ -203,11 +208,13 @@ impl Package {
         let mut signature_data = Vec::new();
         let signature_valid = archive
             .by_name(&signature)
-            .map_err(|error| Error::Other(format!("Unable to read produced IPA signature: {error}")))
+            .map_err(|error| {
+                Error::Other(format!("Unable to read produced IPA signature: {error}"))
+            })
             .and_then(|mut entry| {
-                entry
-                    .read_to_end(&mut signature_data)
-                    .map_err(|error| Error::Other(format!("Unable to read produced IPA signature: {error}")))
+                entry.read_to_end(&mut signature_data).map_err(|error| {
+                    Error::Other(format!("Unable to read produced IPA signature: {error}"))
+                })
             })
             .is_ok()
             && !signature_data.is_empty();
@@ -222,11 +229,13 @@ impl Package {
             let mut profile_data = Vec::new();
             let profile_valid = archive
                 .by_name(&profile)
-                .map_err(|error| Error::Other(format!("Unable to read produced IPA profile: {error}")))
+                .map_err(|error| {
+                    Error::Other(format!("Unable to read produced IPA profile: {error}"))
+                })
                 .and_then(|mut entry| {
-                    entry
-                        .read_to_end(&mut profile_data)
-                        .map_err(|error| Error::Other(format!("Unable to read produced IPA profile: {error}")))
+                    entry.read_to_end(&mut profile_data).map_err(|error| {
+                        Error::Other(format!("Unable to read produced IPA profile: {error}"))
+                    })
                 })
                 .is_ok()
                 && !profile_data.is_empty();
@@ -235,12 +244,11 @@ impl Package {
                     "Produced IPA has no embedded provisioning profile".to_string(),
                 ));
             }
-            MobileProvision::load_with_bytes(profile_data)
-                .map_err(|error| {
-                    Error::Other(format!(
-                        "Produced IPA has an invalid provisioning profile: {error}"
-                    ))
-                })?;
+            MobileProvision::load_with_bytes(profile_data).map_err(|error| {
+                Error::Other(format!(
+                    "Produced IPA has an invalid provisioning profile: {error}"
+                ))
+            })?;
         }
 
         Ok(())

@@ -173,7 +173,7 @@ pub async fn execute(args: SignArgs) -> Result<()> {
             .modify_bundle(&bundle, &Some(team_id.clone()))
             .await?;
 
-        if let Some(dev) = device.as_ref().filter(|device| !device.is_mac) {
+        if let Some(dev) = device.as_ref() {
             log::info!("Registering device: {} ({})", dev.name, dev.udid);
             session
                 .qh_ensure_device(&team_id, &dev.name, &dev.udid, platform)
@@ -181,14 +181,7 @@ pub async fn execute(args: SignArgs) -> Result<()> {
         }
 
         signer
-            .register_bundle_for_device(
-                &bundle,
-                &session,
-                &team_id,
-                false,
-                platform,
-                device_udid,
-            )
+            .register_bundle_for_device(&bundle, &session, &team_id, false, platform, device_udid)
             .await?;
         signer
             .sign_bundle_for_device(&bundle, platform, device_udid)
