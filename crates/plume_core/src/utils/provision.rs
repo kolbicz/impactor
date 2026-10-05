@@ -24,13 +24,8 @@ impl MobileProvision {
     }
 
     pub fn load_with_bytes(data: Vec<u8>) -> Result<Self, Error> {
-        let (
-            entitlements,
-            expiration_date,
-            platforms,
-            provisioned_devices,
-            developer_certificates,
-        ) = Self::extract_profile_data(&data)?;
+        let (entitlements, expiration_date, platforms, provisioned_devices, developer_certificates) =
+            Self::extract_profile_data(&data)?;
 
         Ok(Self {
             data,
@@ -48,10 +43,10 @@ impl MobileProvision {
         new_application_id: &str,
     ) -> Result<(), Error> {
         let macho = MachO::new(&binary_path)?;
-        let binary_entitlements = macho
-            .entitlements()
-            .clone()
-            .ok_or(Error::ProvisioningEntitlementsUnknown)?;
+        // Some distributable IPAs have had their original signature stripped and therefore
+        // contain no embedded entitlements. The provisioning profile remains the source of
+        // truth in that case; an empty set still lets us replace any profile wildcards below.
+        let binary_entitlements = macho.entitlements().clone().unwrap_or_default();
 
         let new_team_id = self
             .entitlements
@@ -201,13 +196,7 @@ impl MobileProvision {
         certificate_der: Option<&[u8]>,
         entitlements: &Dictionary,
     ) -> Result<(), Error> {
-        self.validate_for(
-            platform,
-            bundle_id,
-            device_udid,
-            certificate_der,
-            None,
-        )?;
+        self.validate_for(platform, bundle_id, device_udid, certificate_der, None)?;
 
         let profile_application_identifier = self
             .entitlements
@@ -226,8 +215,8 @@ impl MobileProvision {
                     "signed executable has no application identifier".to_string(),
                 )
             })?;
-        let final_bundle_id = application_identifier_bundle_id(application_identifier)
-            .ok_or_else(|| {
+        let final_bundle_id =
+            application_identifier_bundle_id(application_identifier).ok_or_else(|| {
                 Error::ProvisioningProfileInvalid(
                     "signed executable has an invalid application identifier".to_string(),
                 )
@@ -246,9 +235,7 @@ impl MobileProvision {
             .and_then(Value::as_string)
             .or_else(|| application_identifier_team(profile_application_identifier))
             .ok_or_else(|| {
-                Error::ProvisioningProfileInvalid(
-                    "profile has no team identifier".to_string(),
-                )
+                Error::ProvisioningProfileInvalid("profile has no team identifier".to_string())
             })?;
         let final_team_identifier = entitlements
             .get("com.apple.developer.team-identifier")
@@ -364,13 +351,11 @@ fn application_identifier_grants(granted: &str, requested: &str) -> bool {
         return true;
     }
 
-    granted_bundle_id
-        .strip_suffix(".*")
-        .is_some_and(|prefix| {
-            requested
-                .strip_prefix(prefix)
-                .is_some_and(|remainder| remainder.starts_with('.'))
-        })
+    granted_bundle_id.strip_suffix(".*").is_some_and(|prefix| {
+        requested
+            .strip_prefix(prefix)
+            .is_some_and(|remainder| remainder.starts_with('.'))
+    })
 }
 
 fn application_identifier_bundle_id(value: &str) -> Option<&str> {
@@ -403,16 +388,18 @@ fn application_identifier_team(value: &str) -> Option<&str> {
 fn value_grants(granted: &Value, requested: &Value) -> bool {
     match (granted, requested) {
         (Value::String(granted), Value::String(requested)) => wildcard_matches(granted, requested),
-        (Value::Array(granted), Value::Array(requested)) => requested
-            .iter()
-            .all(|requested| granted.iter().any(|granted| value_grants(granted, requested))),
-        (Value::Dictionary(granted), Value::Dictionary(requested)) => requested.iter().all(
-            |(key, requested)| {
+        (Value::Array(granted), Value::Array(requested)) => requested.iter().all(|requested| {
+            granted
+                .iter()
+                .any(|granted| value_grants(granted, requested))
+        }),
+        (Value::Dictionary(granted), Value::Dictionary(requested)) => {
+            requested.iter().all(|(key, requested)| {
                 granted
                     .get(key)
                     .is_some_and(|granted| value_grants(granted, requested))
-            },
-        ),
+            })
+        }
         _ => granted == requested,
     }
 }
@@ -451,8 +438,5 @@ pub fn is_valid_device_udid(value: &str) -> bool {
     let is_hex = |part: &[u8]| part.iter().all(|byte| byte.is_ascii_hexdigit());
 
     (bytes.len() == 40 && is_hex(bytes))
-        || (bytes.len() == 25
-            && bytes[8] == b'-'
-            && is_hex(&bytes[..8])
-            && is_hex(&bytes[9..]))
+        || (bytes.len() == 25 && bytes[8] == b'-' && is_hex(&bytes[..8]) && is_hex(&bytes[9..]))
 }
