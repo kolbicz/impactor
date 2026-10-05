@@ -44,9 +44,13 @@ impl MobileProvision {
     ) -> Result<(), Error> {
         let macho = MachO::new(&binary_path)?;
         // Some distributable IPAs have had their original signature stripped and therefore
-        // contain no embedded entitlements. The provisioning profile remains the source of
-        // truth in that case; an empty set still lets us replace any profile wildcards below.
-        let binary_entitlements = macho.entitlements().clone().unwrap_or_default();
+        // contain no embedded entitlements. In that case the provisioning profile is already
+        // the complete source of truth. Preserve it verbatim: treating the missing set as an
+        // empty set would still rewrite wildcard keychain groups and can make iOS reject the
+        // resulting application during installation.
+        let Some(binary_entitlements) = macho.entitlements().clone() else {
+            return Ok(());
+        };
 
         let new_team_id = self
             .entitlements
