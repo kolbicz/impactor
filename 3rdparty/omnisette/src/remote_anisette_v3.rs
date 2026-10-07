@@ -128,6 +128,18 @@ pub struct AnisetteClient {
     url: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "result")]
+enum ProvisionInput {
+    GiveIdentifier,
+    GiveStartProvisioningData,
+    GiveEndProvisioningData { cpim: String },
+    ProvisioningSuccess { adi_pb: String },
+    Timeout,
+}
+
+const PROVISIONING_ATTEMPTS: usize = 3;
+
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct ProvisionBodyData {
@@ -280,6 +292,26 @@ impl AnisetteClient {
     }
 
     pub async fn provision(&self, state: &mut AnisetteState) -> Result<(), AnisetteError> {
+        for attempt in 0..PROVISIONING_ATTEMPTS {
+            match self.provision_once(state).await {
+                Err(AnisetteError::ProvisioningTimeout) if attempt + 1 < PROVISIONING_ATTEMPTS => {
+                    let delay = std::time::Duration::from_secs(1 << attempt);
+                    debug!(
+                        "Anisette provisioning timed out; retrying in {} second(s) ({}/{})",
+                        delay.as_secs(),
+                        attempt + 2,
+                        PROVISIONING_ATTEMPTS
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                result => return result,
+            }
+        }
+
+        Err(AnisetteError::ProvisioningTimeout)
+    }
+
+    async fn provision_once(&self, state: &mut AnisetteState) -> Result<(), AnisetteError> {
         debug!("Provisioning Anisette");
         let http_client = make_reqwest()?;
         let resp = self
@@ -319,24 +351,15 @@ impl AnisetteClient {
             format!("{}/v3/provisioning_session", self.url).replace("https://", "wss://");
         let (mut connection, _) = connect_async(&provision_ws_url).await?;
 
-        #[derive(Deserialize)]
-        #[serde(tag = "result")]
-        enum ProvisionInput {
-            GiveIdentifier,
-            GiveStartProvisioningData,
-            GiveEndProvisioningData {
-                #[allow(dead_code)] // it's not even dead, rust just has problems
-                cpim: String,
-            },
-            ProvisioningSuccess {
-                #[allow(dead_code)] // it's not even dead, rust just has problems
-                adi_pb: String,
-            },
-        }
-
         loop {
-            let Some(Ok(data)) = connection.next().await else {
-                continue;
+            let data = match connection.next().await {
+                Some(Ok(data)) => data,
+                Some(Err(error)) => return Err(error.into()),
+                None => {
+                    return Err(AnisetteError::ServerError(
+                        "provisioning connection closed before completion".to_string(),
+                    ));
+                }
             };
             if data.is_text() {
                 let txt = data.to_text().unwrap();
@@ -437,9 +460,16 @@ impl AnisetteClient {
                         connection.close(None).await?;
                         break;
                     }
+                    ProvisionInput::Timeout => {
+                        debug!("Anisette provisioning server timed out");
+                        connection.close(None).await?;
+                        return Err(AnisetteError::ProvisioningTimeout);
+                    }
                 }
             } else if data.is_close() {
-                break;
+                return Err(AnisetteError::ServerError(
+                    "provisioning connection closed before completion".to_string(),
+                ));
             }
         }
 
@@ -517,10 +547,17 @@ impl AnisetteHeadersProvider for RemoteAnisetteProviderV3 {
 
 #[cfg(test)]
 mod tests {
+    use super::ProvisionInput;
     use crate::anisette_headers_provider::AnisetteHeadersProvider;
     use crate::remote_anisette_v3::RemoteAnisetteProviderV3;
     use crate::{AnisetteError, DEFAULT_ANISETTE_URL_V3};
     use log::info;
+
+    #[test]
+    fn recognizes_provisioning_timeout() {
+        let message: ProvisionInput = serde_json::from_str(r#"{"result":"Timeout"}"#).unwrap();
+        assert!(matches!(message, ProvisionInput::Timeout));
+    }
 
     #[tokio::test]
     async fn fetch_anisette_remote_v3() -> Result<(), AnisetteError> {
