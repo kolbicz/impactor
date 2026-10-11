@@ -98,7 +98,6 @@ impl MobileProvision {
         bundle_id: &str,
         device_udid: Option<&str>,
         certificate_der: Option<&[u8]>,
-        requested_entitlements: Option<&Dictionary>,
     ) -> Result<(), Error> {
         if self.platforms.is_empty()
             || !self
@@ -167,34 +166,6 @@ impl MobileProvision {
             ));
         }
 
-        if let Some(requested_entitlements) = requested_entitlements {
-            for (key, requested) in requested_entitlements {
-                if matches!(
-                    key.as_str(),
-                    "application-identifier"
-                        | "com.apple.developer.team-identifier"
-                        | "keychain-access-groups"
-                ) {
-                    // These values contain the original signing team's identifier and are
-                    // rewritten by merge_entitlements before signing. The final entitlement
-                    // validation below still verifies the rewritten keychain groups against
-                    // the selected provisioning profile.
-                    continue;
-                }
-
-                let Some(granted) = self.entitlements.get(key) else {
-                    return Err(Error::ProvisioningProfileInvalid(format!(
-                        "profile does not grant entitlement {key:?}"
-                    )));
-                };
-                if !value_grants(granted, requested) {
-                    return Err(Error::ProvisioningProfileInvalid(format!(
-                        "profile does not grant entitlement {key:?}"
-                    )));
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -206,7 +177,7 @@ impl MobileProvision {
         certificate_der: Option<&[u8]>,
         entitlements: &Dictionary,
     ) -> Result<(), Error> {
-        self.validate_for(platform, bundle_id, device_udid, certificate_der, None)?;
+        self.validate_for(platform, bundle_id, device_udid, certificate_der)?;
 
         let profile_application_identifier = self
             .entitlements

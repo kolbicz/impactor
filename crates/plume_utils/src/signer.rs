@@ -372,13 +372,11 @@ impl Signer {
                 let mut mobile_provision = MobileProvision::load_with_bytes(
                     profiles.provisioning_profile.encoded_profile.as_ref().to_vec(),
                 )?;
-                let requested_entitlements = macho.entitlements().as_ref();
                 if let Err(error) = mobile_provision.validate_for(
                     platform,
                     &id,
                     device_udid.as_deref(),
                     certificate_der.as_deref(),
-                    requested_entitlements,
                 ) {
                     log::warn!(
                         "Cached or newly returned profile for {id} failed validation: {error}; requesting a replacement"
@@ -394,7 +392,6 @@ impl Signer {
                         &id,
                         device_udid.as_deref(),
                         certificate_der.as_deref(),
-                        requested_entitlements,
                     )
                     .map_err(|replacement_error| {
                         Error::Core(replacement_error)
@@ -552,7 +549,6 @@ impl Signer {
                 .get_executable()
                 .ok_or_else(|| Error::Other("Signable bundle has no executable".into()))?;
             let binary_path = signed_bundle.bundle_dir().join(executable_name);
-            let macho = plume_core::MachO::new(&binary_path)?;
             let mut last_error = None;
 
             let matching_profile = self.provisioning_files.iter().find(|profile| {
@@ -561,7 +557,6 @@ impl Signer {
                     &bundle_id,
                     device_udid,
                     certificate_der,
-                    macho.entitlements().as_ref(),
                 ) {
                     Ok(()) => true,
                     Err(error) => {
@@ -670,12 +665,6 @@ impl Signer {
         let binary_path = bundle
             .get_executable()
             .map(|executable| bundle.bundle_dir().join(executable));
-        let requested_entitlements = binary_path
-            .as_ref()
-            .map(plume_core::MachO::new)
-            .transpose()?
-            .and_then(|macho| macho.entitlements().clone());
-
         // Only Apps and AppExtensions should have entitlements from provisioning profiles
         // Dylibs, frameworks, and other components should be signed without entitlements
         // Skip provisioning profile handling for adhoc signing
@@ -692,7 +681,6 @@ impl Signer {
                         self.certificate
                             .as_ref()
                             .and_then(CertificateIdentity::certificate_der),
-                        requested_entitlements.as_ref(),
                     )
                     .is_ok()
                 })
