@@ -171,8 +171,14 @@ impl MobileProvision {
             for (key, requested) in requested_entitlements {
                 if matches!(
                     key.as_str(),
-                    "application-identifier" | "com.apple.developer.team-identifier"
+                    "application-identifier"
+                        | "com.apple.developer.team-identifier"
+                        | "keychain-access-groups"
                 ) {
+                    // These values contain the original signing team's identifier and are
+                    // rewritten by merge_entitlements before signing. The final entitlement
+                    // validation below still verifies the rewritten keychain groups against
+                    // the selected provisioning profile.
                     continue;
                 }
 
@@ -443,4 +449,21 @@ pub fn is_valid_device_udid(value: &str) -> bool {
 
     (bytes.len() == 40 && is_hex(bytes))
         || (bytes.len() == 25 && bytes[8] == b'-' && is_hex(&bytes[..8]) && is_hex(&bytes[9..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_wildcard_grants_rewritten_keychain_group() {
+        assert!(value_grants(
+            &Value::String("NEWTEAM123.*".to_string()),
+            &Value::String("NEWTEAM123.com.example.app".to_string()),
+        ));
+        assert!(!value_grants(
+            &Value::String("NEWTEAM123.*".to_string()),
+            &Value::String("OLDTEAM456.com.example.app".to_string()),
+        ));
+    }
 }
