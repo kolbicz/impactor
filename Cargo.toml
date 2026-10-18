@@ -30,7 +30,11 @@ opt-level = "s"             # reduces binary size by ~25%
 panic = "abort"             # reduces binary size by ~50% in combination with -Zbuild-std-features=panic_immediate_abort
 split-debuginfo = "packed"  # generates a separate *.dwp/*.dSYM so the binary can get stripped
 strip = "symbols"           # See split-debuginfo - allows us to drop the size by ~65%
-incremental = true          # Improves re-compile times
+incremental = false         # With fat LTO + 1 codegen unit the cache barely helps but costs ~5 GB
+
+# Skip debug info for dependencies in dev builds; our own crates keep full debug info.
+[profile.dev.package."*"]
+debug = false
 
 [workspace.dependencies]
 tokio = { version = "1.43", features = ["rt-multi-thread"] }
