@@ -94,8 +94,11 @@ impl DeviceDiscovery for MdnsDiscovery {
                             let hostname = info.get_hostname();
                             let instance_name =
                                 parse_instance_name(info.get_fullname(), service_type);
-                            let addresses: Vec<std::net::IpAddr> =
-                                info.get_addresses().iter().copied().collect();
+                            let addresses: Vec<std::net::IpAddr> = info
+                                .get_addresses()
+                                .iter()
+                                .map(|address| address.to_ip_addr())
+                                .collect();
                             let port = Some(info.get_port());
 
                             let device = build_device(
