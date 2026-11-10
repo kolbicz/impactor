@@ -60,6 +60,10 @@ impl Package {
         &self.package_file
     }
 
+    pub fn source_package_file(&self) -> &Path {
+        &self.source_package_file
+    }
+
     pub fn reload_from_source(&self) -> Result<Self, Error> {
         Self::new(self.source_package_file.clone())
     }

@@ -356,6 +356,12 @@ impl PackageScreen {
         let pkg_name = pkg.get_name().unwrap_or_default();
         let pkg_id = pkg.get_bundle_identifier().unwrap_or_default();
         let pkg_ver = pkg.get_version().unwrap_or_default();
+        let source_path = pkg.source_package_file().to_string_lossy().into_owned();
+        let source_file = pkg
+            .source_package_file()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| source_path.clone());
 
         column![
             row![
@@ -372,6 +378,10 @@ impl PackageScreen {
                 .spacing(8),
             ]
             .spacing(8),
+            text(t!("options_ipa_file")).size(12),
+            text(source_file).size(14).width(Fill),
+            text(t!("options_ipa_path")).size(12),
+            text(source_path).size(11).width(Fill),
             text(t!("options_identifier")).size(12),
             text_input(
                 "com.example.app",
