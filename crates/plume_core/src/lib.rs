@@ -30,6 +30,8 @@ pub enum Error {
         http_code: Option<u16>,
         message: String,
     },
+    #[error("HTTP request error {status} attempting to connect to {url}")]
+    GeneralHttpError { url: String, status: u16 },
     #[error("Request to developer session failed")]
     DeveloperSessionRequestFailed,
     #[error("Authentication SRP error {0}: {1}")]

@@ -82,6 +82,11 @@ impl Account {
                     }
                 }
                 LoginState::Needs2FAVerification => {
+                    if trusted_phone_numbers.is_empty() {
+                        if let Ok(extras) = _self.get_auth_extras().await {
+                            trusted_phone_numbers = extras.trusted_phone_numbers;
+                        }
+                    }
                     let request = TwoFactorRequest {
                         method: TwoFactorMethod::Device,
                         trusted_phone_numbers: trusted_phone_numbers.clone(),
@@ -268,6 +273,10 @@ impl Account {
                 "secondaryAuth" => Ok(LoginState::NeedsSMS2FA),
                 other => Ok(LoginState::NeedsExtraStep(other.to_string())),
             };
+        }
+
+        if status.get("hsc").and_then(|value| value.as_signed_integer()) == Some(409) {
+            return Ok(LoginState::Needs2FAVerification);
         }
 
         Ok(LoginState::LoggedIn)

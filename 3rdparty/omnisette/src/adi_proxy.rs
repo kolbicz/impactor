@@ -122,7 +122,7 @@ pub trait ConfigurableADIProxy: ADIProxy {
 }
 
 pub const AKD_USER_AGENT: &str = "akd/1.0 CFNetwork/808.1.4";
-pub const CLIENT_INFO_HEADER: &str =
+pub const LOOKUP_CLIENT_INFO: &str =
     "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
 pub const DS_ID: i64 = -2;
 pub const IDENTIFIER_LENGTH: usize = 16;
@@ -166,10 +166,6 @@ impl dyn ADIProxy {
         headers.insert("Content-Type", HeaderValue::from_str("text/x-xml-plist")?);
 
         headers.insert(
-            "X-Mme-Client-Info",
-            HeaderValue::from_str(CLIENT_INFO_HEADER)?,
-        );
-        headers.insert(
             "X-Mme-Device-Id",
             HeaderValue::from_str(self.get_device_identifier().as_str())?,
         );
@@ -200,6 +196,7 @@ impl dyn ADIProxy {
 
         let url_bag_res = client
             .get("https://gsa.apple.com/grandslam/GsService2/lookup")
+            .header("X-Mme-Client-Info", LOOKUP_CLIENT_INFO)
             .send()
             .await?
             .plist()
@@ -368,10 +365,6 @@ impl<ProxyType: ADIProxy + 'static> AnisetteHeadersProvider
         headers.insert(
             "X-Apple-I-SRL-NO".to_string(),
             adi_proxy.get_serial_number(),
-        );
-        headers.insert(
-            "X-Mme-Client-Info".to_string(),
-            CLIENT_INFO_HEADER.to_string(),
         );
         headers.insert(
             "X-Mme-Device-Id".to_string(),
